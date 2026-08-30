@@ -695,6 +695,79 @@ mod tests {
         assert_eq!(update(HarnessId::Mock), None);
     }
 
+    /// D107 named this registry's Grok and Hermes rows as carrying
+    /// `install: None, update: None` — true of the two lines' *static*
+    /// literal (every lazy descriptor above starts that way; it is the same
+    /// two lines for `ClaudeCode` and `Codex`), but the overlay this registry
+    /// does is `HarnessId`-agnostic: nothing here branches on which harness a
+    /// probe belongs to. `comet_harness::probe_installed_cli` — the same
+    /// helper `ClaudeHarness`/`CodexHarness` route through — is what both
+    /// `GrokHarness::probe()` and `HermesHarness::probe()` already call, so a
+    /// resolved `grok`/`hermes` binary already publishes a real
+    /// `HarnessInstall` through this exact path. What a real Grok/Hermes
+    /// probe cannot yet supply is `update`: neither has a per-provider
+    /// self-update-state reader the way `claude/update.rs` and
+    /// `codex/update.rs` do, so their `HarnessProbe::update` stays `None` —
+    /// a data gap in `comet-harness`, not a registry limitation.
+    #[test]
+    fn a_grok_or_hermes_probe_result_overlays_exactly_like_claude_or_codexs() {
+        let registry = default_registry();
+        for (id, path, method) in [
+            (
+                HarnessId::Grok,
+                "/Users/a/.grok/bin/grok",
+                comet_proto::InstallMethod::Native,
+            ),
+            (
+                HarnessId::Hermes,
+                "/Users/a/.local/bin/hermes",
+                comet_proto::InstallMethod::Native,
+            ),
+        ] {
+            registry.set_probe(
+                id,
+                HarnessProbe {
+                    availability: HarnessAvailability::Available {
+                        version: Some("1.0.5".into()),
+                    },
+                    install: Some(HarnessInstall {
+                        path: path.into(),
+                        method,
+                    }),
+                    // No per-provider update reader exists for either agent
+                    // yet (see this test's own doc comment) — the honest
+                    // shape today, not a registry-side omission.
+                    update: None,
+                },
+            );
+        }
+
+        let descriptor = |id: HarnessId| {
+            registry
+                .descriptors()
+                .into_iter()
+                .find(|d| d.id == id)
+                .expect("harness in catalog")
+        };
+
+        let grok = descriptor(HarnessId::Grok);
+        let install = grok.install.expect("Grok's probed install must publish");
+        assert_eq!(install.path, "/Users/a/.grok/bin/grok");
+        assert_eq!(install.method, comet_proto::InstallMethod::Native);
+        assert_eq!(
+            grok.availability,
+            HarnessAvailability::Available {
+                version: Some("1.0.5".into())
+            }
+        );
+        assert_eq!(grok.update, None);
+
+        let hermes = descriptor(HarnessId::Hermes);
+        let install = hermes.install.expect("Hermes' probed install must publish");
+        assert_eq!(install.path, "/Users/a/.local/bin/hermes");
+        assert_eq!(hermes.update, None);
+    }
+
     /// The overlay must survive a lazy slot resolving, which swaps the stored
     /// descriptor for a `describe()`-derived one. `describe()` cannot know the
     /// probe result, so a naive implementation loses it on first use.
