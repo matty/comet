@@ -136,6 +136,52 @@ pub(crate) type ConfigRequests = fn(&RunRequest, &str) -> Vec<(&'static str, Val
 /// to sign in" on a guess.
 pub(crate) type OpenFailureMapper = fn(&crate::jsonrpc::RpcFailure) -> Option<HarnessError>;
 
+/// A vendor's own out-of-band turn-completion notification — one that can
+/// end a turn ahead of, or entirely without, the ordinary `session/prompt`
+/// RPC reply.
+///
+/// **Per-agent, injected by the caller, the same way [`UsageReader`],
+/// [`ConfigRequests`] and [`OpenFailureMapper`] are** (D122) — see
+/// [`UsageReader`]'s own doc comment for why the choice stays out of this
+/// file rather than a `match` on [`HarnessId`] in disguise. The method name a
+/// vendor extension speaks, where its own promptId lives on the notification
+/// versus on a settled RPC reply, and how long to keep polling that reply
+/// once the notification has already ended the turn, are all `_x.ai` facts
+/// and used to live here regardless.
+///
+/// **`None` for an agent that sends no such notification.** Hermes supplies
+/// `None`, and that is what keeps the arm below inert for it — **not a
+/// per-agent flag, and not a `match` on [`HarnessId`]**: the settle arm
+/// recognizes a notification purely by comparing its wire `method` against
+/// [`Self::method`] whenever a signal was supplied at all, so an agent that
+/// supplies none can never match, with nothing here naming which agent that
+/// is. `grok::SETTLE_SIGNAL`'s own doc comment carries the argument for why
+/// recognizing the method BY NAME, rather than gating on a boolean
+/// capability flag, is the version of this that cannot go silently dead for
+/// a third agent that later grows its own version of this notification
+/// under a different name.
+#[derive(Clone, Copy)]
+pub struct SettleSignal {
+    /// The notification's own JSON-RPC method name.
+    pub method: &'static str,
+    /// This vendor's own promptId, read off the notification's `params`.
+    /// `None` when the field is absent — an honest "did not say", which the
+    /// settle arm's own guard reads as "not proven stale" rather than as
+    /// evidence to refuse on (see that guard's doc comment).
+    pub notification_prompt_id: fn(&Value) -> Option<&str>,
+    /// This vendor's own promptId, read off a settled `session/prompt` RPC
+    /// reply's `result` — used both when the ordinary reply wins the race
+    /// against this notification, and when this notification wins it and the
+    /// reply is polled afterward, within [`Self::reply_bound`], to still
+    /// harvest usage from it.
+    pub reply_prompt_id: fn(&Value) -> Option<&str>,
+    /// How long to keep polling the in-flight `session/prompt` reply, once
+    /// this notification has already ended the turn, before giving up on
+    /// harvesting usage from it. See `grok::SETTLE_SIGNAL`'s own doc comment
+    /// for the reasoning behind the value it supplies.
+    pub reply_bound: Duration,
+}
+
 /// The timeouts the loop is built from. A struct rather than four arguments so
 /// a test can shrink them without every call site naming all four.
 #[derive(Clone, Copy, Debug)]
@@ -778,6 +824,7 @@ pub fn run(
     request: RunRequest,
     controls: RunControls,
     usage_reader: UsageReader,
+    settle: Option<SettleSignal>,
 ) -> BoxStream<'static, Result<AgentEvent, HarnessError>> {
     let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
     tokio::spawn(run_session(
@@ -786,6 +833,7 @@ pub fn run(
         request,
         controls,
         usage_reader,
+        settle,
         event_tx,
     ));
     futures::stream::unfold(event_rx, |mut rx| async move {
@@ -816,6 +864,7 @@ async fn run_session(
     request: RunRequest,
     controls: RunControls,
     usage_reader: UsageReader,
+    settle: Option<SettleSignal>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) {
     let AcpSession {
@@ -888,11 +937,11 @@ async fn run_session(
     let mut seen_diagnostics: HashSet<String> = HashSet::new();
     // Every promptId that has already settled a turn this session, off
     // EITHER signal (see the notification arm in `drive_turn`, and
-    // `PROMPT_COMPLETE_METHOD`). Session-scoped like `seen_diagnostics`: a
-    // completion notification that arrives late — after its own turn already
-    // settled off the RPC reply — must not be read as completing a LATER
-    // turn on the same session, which is exactly the "foreign/stale
-    // completion" risk Grok's own hardening notes name.
+    // `SettleSignal`). Session-scoped like `seen_diagnostics`: a completion
+    // notification that arrives late — after its own turn already settled
+    // off the RPC reply — must not be read as completing a LATER turn on the
+    // same session, which is exactly the "foreign/stale completion" risk
+    // Grok's own hardening notes name.
     let mut prompt_completions = PromptCompletions::default();
 
     // **One `Done` per turn that started, not one per run.** The session is
@@ -926,6 +975,7 @@ async fn run_session(
                 streamed: &mut streamed_this_turn,
                 context_window,
                 usage_reader,
+                settle,
                 prompt_completions: &mut prompt_completions,
                 request_approval: &request_approval,
             },
@@ -1119,8 +1169,11 @@ struct Turn<'a> {
     /// This agent's own reading of a `session/prompt` result — see
     /// [`UsageReader`].
     usage_reader: UsageReader,
+    /// This agent's own out-of-band turn-completion notification, if it has
+    /// one — see [`SettleSignal`].
+    settle: Option<SettleSignal>,
     /// Every promptId that has already settled a turn this session. Outlives
-    /// the turn for the same reason `diagnostics` does: [`PROMPT_COMPLETE_METHOD`]'s
+    /// the turn for the same reason `diagnostics` does: a [`SettleSignal`]'s
     /// notification, arriving late after ITS OWN turn already settled off the
     /// ordinary RPC reply, must not be read as completing a later turn on the
     /// same session.
@@ -1130,27 +1183,6 @@ struct Turn<'a> {
     /// that outlives the borrow of this `Turn` — see [`RequestApprovalFn`].
     request_approval: &'a Arc<RequestApprovalFn>,
 }
-
-/// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
-/// live 2026-08-28, raw wire timestamps: this notification at 3618ms,
-/// the matching `session/prompt` RPC response at 3621ms — 3ms apart,
-/// consistently, this notification first.** That raw capture lives outside
-/// this tree (the ACP hardening task's own planning record, not restated
-/// verbatim anywhere else in `crates/`); this doc comment is the primary
-/// citation inside the tree for the figure, not a pointer to one. No other
-/// recorded speaker sends it — Hermes advertises
-/// nothing under `_x.ai/*` — so recognizing it by method name alone, rather
-/// than gating on a per-agent flag, leaves the arm silently dead for anyone
-/// who doesn't; the RPC response stays the fallback for exactly that case.
-///
-/// A repo-wide guard (`crates/engine/tests/no_runtime_cloud.rs`) forbids a
-/// slash, the word "session", and another slash appearing contiguously
-/// anywhere under `crates/`, as a check against reintroducing
-/// hosted-authority remnants. This vendor method name is not one, and the
-/// guard exempts it by name — spelled plainly here so that
-/// `grep -r "_x.ai/session/prompt_complete" crates/` finds the constant this
-/// doc calls the method's primary citation.
-const PROMPT_COMPLETE_METHOD: &str = "_x.ai/session/prompt_complete";
 
 /// Bound on [`PromptCompletions`] (`docs/debt/README.md`'s D124) — the same
 /// "cannot become an allocator" concern `normalize`'s `MAX_TRACKED_UPDATE_KINDS`
@@ -1220,28 +1252,28 @@ impl PromptCompletions {
     }
 }
 
-/// How long the notification-settle arm below waits for the already-in-flight
-/// `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`] has already ended
-/// the turn — long enough to catch the ~3ms gap [`PROMPT_COMPLETE_METHOD`]'s
-/// own doc measured live, short enough that an agent which never answers the
-/// RPC at all (`complete-notification-only` in the fixture, and the shape
-/// upstream's original hang report was about) still settles promptly rather
-/// than reintroducing that hang.
+/// Whether an incoming notification is THIS agent's own out-of-band
+/// completion signal, settling a fresh (non-stale) prompt on our own
+/// session.
 ///
-/// **~80x the measured ~3ms gap, not a round number picked for its own
-/// sake.** A single measurement on one machine on one day is thin evidence
-/// for a bound that fails SILENTLY when it is too tight — this build has no
-/// drift sheet, no supported-version floor and no runnable live suite for
-/// Grok (`docs/debt/README.md`'s D102), so a miss here would not be caught
-/// by anything else in the tree. The margin also has to absorb process
-/// scheduling and named-pipe latency on whatever machine runs this, not just
-/// scheduler jitter on the one that measured 3ms — this repository's own
-/// guidance is that a wall-clock figure from a GPU-less VM is an upper
-/// bound, not a measurement. Still 120x below [`Timeouts::prompt_stall`]'s
-/// own 30s default, so this can never be mistaken for — or mask — a wedged
-/// agent: the only user-visible cost of a genuinely non-answering agent is
-/// one extra 250ms per turn, not a hang.
-const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(250);
+/// **`false` whenever `settle` is `None`** — an agent that supplies no
+/// [`SettleSignal`] can never match here, which is what keeps this arm inert
+/// for it (see that type's own doc comment for why that is deliberate and
+/// not merely the absence of a flag nobody set).
+fn is_settle_notification(
+    settle: Option<SettleSignal>,
+    method: &str,
+    params: &Value,
+    session_id: &str,
+    prompt_completions: &PromptCompletions,
+) -> bool {
+    let Some(settle) = settle else {
+        return false;
+    };
+    method == settle.method
+        && params["sessionId"].as_str() == Some(session_id)
+        && (settle.notification_prompt_id)(params).is_none_or(|id| !prompt_completions.contains(id))
+}
 
 /// One `session/prompt`, from send to `stopReason`.
 async fn drive_turn(
@@ -1262,6 +1294,7 @@ async fn drive_turn(
         streamed,
         context_window,
         usage_reader,
+        settle,
         prompt_completions,
         request_approval,
     } = turn;
@@ -1269,6 +1302,7 @@ async fn drive_turn(
     let prompt_stall = *prompt_stall;
     let context_window = *context_window;
     let usage_reader = *usage_reader;
+    let settle = *settle;
     let session_id: &str = session_id;
 
     // **Drain any backlog BEFORE sending, not after.** The reader task can
@@ -1345,13 +1379,16 @@ async fn drive_turn(
                         {
                             return TurnEnd::ConsumerGone;
                         }
-                        // Record the settling promptId (Grok's response
-                        // carries it at `_meta.promptId`, verified live) so a
-                        // late duplicate of [`PROMPT_COMPLETE_METHOD`]'s
-                        // notification for THIS turn — one more push behind
-                        // the reply that beat it here — can never re-settle a
-                        // LATER one; see `Turn::prompt_completions`.
-                        if let Some(id) = result["_meta"]["promptId"].as_str() {
+                        // Record the settling promptId, per this agent's own
+                        // [`SettleSignal::reply_prompt_id`] (`None` when the
+                        // caller supplied no signal at all — nothing to
+                        // record) so a late duplicate of ITS notification for
+                        // THIS turn — one more push behind the reply that
+                        // beat it here — can never re-settle a LATER one; see
+                        // `Turn::prompt_completions`.
+                        if let Some(settle) = settle
+                            && let Some(id) = (settle.reply_prompt_id)(&result)
+                        {
                             prompt_completions.insert(id);
                         }
                         // The turn's token reading rides just ahead of its
@@ -1378,8 +1415,12 @@ async fn drive_turn(
             message = incoming.recv() => {
                 first_frame_seen = true;
                 match message {
-                    // The authoritative completion signal (this fn's header
-                    // comment). Guarded on the session matching ours (a
+                    // THIS agent's own out-of-band completion signal, if it
+                    // has one at all (`false` whenever `settle` is `None` —
+                    // see [`SettleSignal`]'s own doc comment for why that,
+                    // not a flag or a `match` on [`HarnessId`], is what keeps
+                    // this arm inert for an agent that sends no such
+                    // notification). Guarded on the session matching ours (a
                     // "foreign session" is not evidence about this turn) and
                     // on the promptId — if present — not already having
                     // settled an EARLIER turn: without that check a late
@@ -1402,13 +1443,18 @@ async fn drive_turn(
                     // branch of the guard is untested in practice, not unsafe
                     // in principle.
                     Some(Incoming::Notification { method, params })
-                        if method == PROMPT_COMPLETE_METHOD
-                            && params["sessionId"].as_str() == Some(session_id)
-                            && params["promptId"]
-                                .as_str()
-                                .is_none_or(|id| !prompt_completions.contains(id))
+                        if is_settle_notification(
+                            settle,
+                            &method,
+                            &params,
+                            session_id,
+                            prompt_completions,
+                        )
                     => {
-                        if let Some(id) = params["promptId"].as_str() {
+                        // The guard above only returns `true` when `settle`
+                        // is `Some`.
+                        let settle = settle.expect("is_settle_notification guarantees Some");
+                        if let Some(id) = (settle.notification_prompt_id)(&params) {
                             prompt_completions.insert(id);
                         }
                         // Same drain rationale as the reply arm above: deltas
@@ -1431,11 +1477,10 @@ async fn drive_turn(
                         // live — Grok's own usage rides the RPC response's
                         // `_meta` instead), so this is honestly `None` on the
                         // NORMAL path — this notification wins the race on
-                        // every healthy turn ([`PROMPT_COMPLETE_METHOD`]'s own
-                        // doc measured it, ~3ms ahead, consistently), not
-                        // merely sometimes; a reader that ever gains a
-                        // usage-bearing notification shape reads it here for
-                        // free.
+                        // every healthy turn (`grok::SETTLE_SIGNAL`'s own doc
+                        // measured it, ~3ms ahead, consistently), not merely
+                        // sometimes; a reader that ever gains a usage-bearing
+                        // notification shape reads it here for free.
                         let mut usage = usage_reader(&params, context_window);
                         // Grok's usage lives only in the RPC reply's `_meta`,
                         // and that reply (`reply`, sent above) is already in
@@ -1444,8 +1489,9 @@ async fn drive_turn(
                         // the settle above always wins the race, so the
                         // `answer = &mut reply` arm that reads it never gets
                         // a turn. Poll it directly instead, bounded by
-                        // [`POST_NOTIFICATION_REPLY_BOUND`] — see that
-                        // const's own doc for why the bound is safe.
+                        // [`SettleSignal::reply_bound`] — see
+                        // `grok::SETTLE_SIGNAL`'s own doc for why the value it
+                        // supplies is safe.
                         //
                         // **Short-circuited on `usage.is_some()`**: a future
                         // reader that ever gains a usage-bearing notification
@@ -1453,18 +1499,16 @@ async fn drive_turn(
                         // rather than pay this bound's latency for nothing —
                         // `reply` is left running, not polled a second time.
                         if usage.is_none() {
-                            match tokio::time::timeout(POST_NOTIFICATION_REPLY_BOUND, &mut reply)
-                                .await
-                            {
+                            match tokio::time::timeout(settle.reply_bound, &mut reply).await {
                                 Ok(Ok(result)) => {
-                                    if let Some(id) = result["_meta"]["promptId"].as_str() {
+                                    if let Some(id) = (settle.reply_prompt_id)(&result) {
                                         prompt_completions.insert(id);
                                     }
                                     usage = usage_reader(&result, context_window);
                                 }
                                 // Bounded miss, not a hang: either the reply
                                 // never came inside
-                                // `POST_NOTIFICATION_REPLY_BOUND` (the
+                                // [`SettleSignal::reply_bound`] (the
                                 // notification-only agent this bound exists
                                 // to still settle promptly for), or it came
                                 // back as an RPC-level error. Either way the
@@ -1483,8 +1527,7 @@ async fn drive_turn(
                                 outcome => {
                                     tracing::debug!(
                                         target: "comet_harness::acp",
-                                        bound_ms = POST_NOTIFICATION_REPLY_BOUND.as_millis()
-                                            as u64,
+                                        bound_ms = settle.reply_bound.as_millis() as u64,
                                         timed_out = outcome.is_err(),
                                         "no usage harvested from the post-notification reply"
                                     );
@@ -1495,7 +1538,7 @@ async fn drive_turn(
                         // before it.** The two drains earlier in this fn only
                         // cover what was buffered before their own settle
                         // signal; this one covers a different window — the
-                        // up-to-`POST_NOTIFICATION_REPLY_BOUND` wait on
+                        // up-to-[`SettleSignal::reply_bound`] wait on
                         // `reply` just above, during which the reader task
                         // can have pushed more frames (a vendor notification
                         // racing the reply on the wire) into `incoming`

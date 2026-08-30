@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use comet_harness::acp::session::{AcpSession, Timeouts};
+use comet_harness::acp::session::{AcpSession, SettleSignal, Timeouts};
 use comet_harness::{CancellationToken, HarnessError, RunControls, SteerMessage};
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus, HarnessId,
@@ -92,6 +92,23 @@ fn no_usage(_: &serde_json::Value, _: Option<u64>) -> Option<AgentEvent> {
 /// ever has a selection to apply.
 fn no_config(_: &RunRequest, _: &str) -> Vec<(&'static str, serde_json::Value)> {
     Vec::new()
+}
+
+/// Grok's own [`SettleSignal`] (D122), mirrored here rather than reused:
+/// `grok::SETTLE_SIGNAL` is `pub(crate)` inside `comet-harness` and
+/// unreachable from this integration-test crate — same reason `test_usage`
+/// mirrors `grok::usage` below instead of naming it. `fake-acp` speaks Grok's
+/// exact wire shape for this notification (`fake_acp.rs`'s own
+/// `PROMPT_COMPLETE_METHOD`), so every field here matches `grok::SETTLE_SIGNAL`
+/// exactly: the method name, both promptId paths, and the 250ms bound several
+/// of this suite's own tests measure their timing against.
+fn settle_signal() -> SettleSignal {
+    SettleSignal {
+        method: "_x.ai/session/prompt_complete",
+        notification_prompt_id: |params| params["promptId"].as_str(),
+        reply_prompt_id: |result| result["_meta"]["promptId"].as_str(),
+        reply_bound: Duration::from_millis(250),
+    }
 }
 
 /// A `cancel_grace` long enough that giving up cannot be what ends a run
@@ -194,6 +211,7 @@ async fn a_turn_runs_from_handshake_to_done() {
         request("hello"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     // One turn only: closing the mailbox is what tells the persistent session
     // no steer is coming. Held open, it would correctly wait for one.
@@ -235,6 +253,7 @@ async fn a_refusal_ends_the_run_without_an_error_message() {
         request("please refusal"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -270,6 +289,7 @@ async fn a_queued_steer_runs_as_the_next_prompt_on_the_same_session() {
         request("first"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
 
     steer
@@ -360,6 +380,7 @@ async fn an_interrupt_the_agent_settles_reports_one_interrupted_done() {
         request("please drop-reply"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     token.cancel();
 
@@ -387,6 +408,7 @@ async fn an_interrupt_a_silent_agent_ignores_still_ends_the_run() {
         request("please starve ignore-cancel"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     token.cancel();
 
@@ -413,6 +435,7 @@ async fn a_turn_settles_on_the_completion_notification_alone() {
         request("please complete-notification-only"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = tokio::time::timeout(Duration::from_secs(5), async { drain(stream).await })
@@ -432,6 +455,37 @@ async fn a_turn_settles_on_the_completion_notification_alone() {
     }
 }
 
+/// **D122's falsification: no [`SettleSignal`] means no recognition at
+/// all.** Same fixture mode as the test above
+/// (`complete-notification-only`: sends the completion notification, then
+/// never answers the RPC), but with `settle: None` — proving the arm is
+/// genuinely inert for an agent that supplies no signal, rather than merely
+/// unexercised in every other test here. If the shared loop still hardcoded
+/// the vendor method name (or gated on a flag this build forgot to unset for
+/// `HarnessId::Mock`), this would settle exactly like the test above;
+/// instead nothing recognizes the notification at all, so the turn is still
+/// waiting on an RPC reply this fixture mode never sends.
+#[tokio::test]
+async fn with_no_settle_signal_the_vendor_notification_goes_unrecognized() {
+    let (controls, steer, _token) = controls();
+    let stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request("please complete-notification-only"),
+        controls,
+        no_usage,
+        None,
+    );
+    drop(steer);
+    let result = tokio::time::timeout(Duration::from_millis(500), drain(stream)).await;
+    assert!(
+        result.is_err(),
+        "with no SettleSignal supplied, the vendor notification must not \
+         settle the turn -- it should still be waiting on the RPC reply \
+         this fixture mode never sends: {result:?}"
+    );
+}
+
 /// The mirror. An agent that never sends the extension must still settle, or
 /// this fix trades one hang for another.
 #[tokio::test]
@@ -447,6 +501,7 @@ async fn a_turn_settles_on_the_rpc_response_alone() {
         request("please complete-response-only"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -486,6 +541,7 @@ async fn both_signals_arriving_produce_exactly_one_done() {
         request("please complete-both"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     // Times each `Done` from when it is OBSERVED, not from stream close:
     // `drain`'s end-to-end time also includes `shutdown_child` reaping the
@@ -612,7 +668,7 @@ async fn both_signals_arriving_produce_exactly_one_done() {
 }
 
 /// D114: the completion notification's session-match guard
-/// (`acp/session.rs`'s `PROMPT_COMPLETE_METHOD` arm) is checked BEFORE the
+/// (`acp/session.rs`'s `SettleSignal` arm) is checked BEFORE the
 /// promptId staleness check, and is real, load-bearing logic in its own
 /// right — a foreign `sessionId` naming a different session is not evidence
 /// about this turn, whatever its promptId says. Nothing before this test
@@ -633,6 +689,7 @@ async fn a_foreign_session_completion_notification_is_not_evidence_about_this_tu
         request("please complete-foreign-session"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -705,6 +762,7 @@ async fn a_notification_settled_turn_still_reports_usage_from_the_reply() {
         request("please complete-both-usage"),
         controls,
         test_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -761,6 +819,7 @@ async fn a_frame_racing_the_post_notification_harvest_lands_on_its_own_turn() {
         request("please complete-race-drain"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
 
     let mut events = Vec::new();
@@ -838,6 +897,7 @@ async fn a_stalled_prompt_ends_in_a_bounded_error() {
         request("please silent-after-prompt"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
 
@@ -875,6 +935,7 @@ async fn an_agent_that_exits_mid_turn_errors_with_an_explanation() {
         request("please exit-now"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -918,6 +979,7 @@ async fn a_permission_request_reaches_the_approval_bridge() {
         request("please request-permission"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -958,6 +1020,7 @@ async fn each_decision_selects_the_matching_option_kind() {
             request("please request-permission"),
             controls,
             no_usage,
+            Some(settle_signal()),
         );
         drop(steer);
         drain(stream).await
@@ -1017,6 +1080,7 @@ async fn allow_for_session_narrows_to_allow_once_on_hermes_real_edit_shape() {
         request("please request-permission-edit"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -1047,6 +1111,7 @@ async fn an_expired_approval_cancels_the_agents_request() {
         request("please request-permission"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -1082,6 +1147,7 @@ async fn an_unrecognized_option_set_denies_and_reports_drift() {
         request("please request-permission-unrecognized"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     drop(steer);
     let events = drain(stream).await;
@@ -1126,6 +1192,7 @@ async fn repeated_protocol_drift_reports_only_once_per_session() {
         request("please request-permission-unrecognized"),
         controls,
         no_usage,
+        Some(settle_signal()),
     );
     steer
         .send(SteerMessage {

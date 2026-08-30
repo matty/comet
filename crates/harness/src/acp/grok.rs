@@ -51,6 +51,7 @@
 //! still holds.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -62,7 +63,7 @@ use comet_proto::{
 };
 
 use super::AgentDescription;
-use super::session::{AcpSession, Discovered, Timeouts};
+use super::session::{AcpSession, Discovered, SettleSignal, Timeouts};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use crate::launch::{LaunchDescriptor, StdioMode};
 use crate::{Harness, HarnessError, RunControls};
@@ -358,6 +359,77 @@ pub(crate) fn usage(result: &Value, context_window: Option<u64>) -> Option<Agent
         context_window,
     })
 }
+
+/// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
+/// live 2026-08-28, raw wire timestamps: this notification at 3618ms,
+/// the matching `session/prompt` RPC response at 3621ms — 3ms apart,
+/// consistently, this notification first.** That raw capture lives outside
+/// this tree (the ACP hardening task's own planning record, not restated
+/// verbatim anywhere else in `crates/`); this doc comment is the primary
+/// citation inside the tree for the figure, not a pointer to one. No other
+/// recorded speaker sends it — Hermes advertises
+/// nothing under `_x.ai/*` — so recognizing it by method name alone, rather
+/// than gating on a per-agent flag, leaves the arm silently dead for anyone
+/// who doesn't; the RPC response stays the fallback for exactly that case.
+///
+/// A repo-wide guard (`crates/engine/tests/no_runtime_cloud.rs`) forbids a
+/// slash, the word "session", and another slash appearing contiguously
+/// anywhere under `crates/`, as a check against reintroducing
+/// hosted-authority remnants. This vendor method name is not one, and the
+/// guard exempts it by name — spelled plainly here so that
+/// `grep -r "_x.ai/session/prompt_complete" crates/` finds the constant this
+/// doc calls the method's primary citation.
+///
+/// **D122: lives here, not in `session.rs`.** The shared turn loop only
+/// knows it as [`super::session::SettleSignal::method`] — an opaque string
+/// it compares an incoming notification's own method against — which is what
+/// lets that file stay free of this (or any other vendor's) wire vocabulary.
+const PROMPT_COMPLETE_METHOD: &str = "_x.ai/session/prompt_complete";
+
+/// How long the shared turn loop's notification-settle arm waits for the
+/// already-in-flight `session/prompt` reply once [`PROMPT_COMPLETE_METHOD`]
+/// has already ended the turn — long enough to catch the ~3ms gap that
+/// constant's own doc measured live, short enough that an agent which never
+/// answers the RPC at all (`complete-notification-only` in `fake-acp`, and
+/// the shape upstream's original hang report was about) still settles
+/// promptly rather than reintroducing that hang.
+///
+/// **~80x the measured ~3ms gap, not a round number picked for its own
+/// sake.** A single measurement on one machine on one day is thin evidence
+/// for a bound that fails SILENTLY when it is too tight — this build has no
+/// drift sheet, no supported-version floor and no runnable live suite for
+/// Grok (`docs/debt/README.md`'s D102), so a miss here would not be caught
+/// by anything else in the tree. The margin also has to absorb process
+/// scheduling and named-pipe latency on whatever machine runs this, not just
+/// scheduler jitter on the one that measured 3ms — this repository's own
+/// guidance is that a wall-clock figure from a GPU-less VM is an upper
+/// bound, not a measurement. Still 120x below `Timeouts::prompt_stall`'s own
+/// 30s default, so this can never be mistaken for — or mask — a wedged
+/// agent: the only user-visible cost of a genuinely non-answering agent is
+/// one extra 250ms per turn, not a hang.
+const POST_NOTIFICATION_REPLY_BOUND: Duration = Duration::from_millis(250);
+
+/// Grok's own [`SettleSignal`] (D122) — injected into
+/// [`super::session::run`] the same way [`usage`] already is, so the method
+/// name above, both promptId paths, and the reply bound stay in this vendor
+/// file rather than in the shared turn loop. `session.rs` never sees this
+/// value's shape: it is handed the whole struct through
+/// `super::session::run`'s own `Option<SettleSignal>` parameter and reads it
+/// generically.
+///
+/// Both promptId readers pull from a DIFFERENT shape: [`Self::method`]'s own
+/// notification carries it at a top-level `promptId`, while a settled
+/// `session/prompt` RPC reply carries the same value nested at
+/// `_meta.promptId` (verified live, both on grok 1.0.5's 2026-08-28
+/// capture) — one struct, two distinct paths, because the wire genuinely
+/// disagrees about where this field lives depending on which message
+/// carries it.
+pub(crate) const SETTLE_SIGNAL: SettleSignal = SettleSignal {
+    method: PROMPT_COMPLETE_METHOD,
+    notification_prompt_id: |params| params["promptId"].as_str(),
+    reply_prompt_id: |result| result["_meta"]["promptId"].as_str(),
+    reply_bound: POST_NOTIFICATION_REPLY_BOUND,
+};
 
 /// One effort id from Grok's vocabulary. An unrecognized rung is dropped rather
 /// than guessed at: offering one the picker cannot send is worse than a shorter
@@ -696,6 +768,7 @@ impl Harness for GrokHarness {
             request,
             controls,
             usage,
+            Some(SETTLE_SIGNAL),
         ))
     }
 }
@@ -1204,6 +1277,43 @@ mod tests {
         assert!(
             map_open_failure(&failure).is_none(),
             "an unrecognized failure must not be reclassified"
+        );
+    }
+
+    /// D122: pins the exact shape handed to the shared turn loop, against the
+    /// literal wire paths grok 1.0.5 answers with — both promptId reads are on
+    /// the CAPTURED shapes (a notification's own top-level `promptId`, a
+    /// settled reply's nested `_meta.promptId`), not on a round-trip through a
+    /// Rust type, per this repo's own rule for pinning what a reply's decode
+    /// depends on.
+    #[test]
+    fn the_settle_signal_carries_grok_s_exact_method_paths_and_bound() {
+        assert_eq!(SETTLE_SIGNAL.method, "_x.ai/session/prompt_complete");
+        assert_eq!(SETTLE_SIGNAL.reply_bound, Duration::from_millis(250));
+
+        let notification = json!({"sessionId": "s-1", "promptId": "p-1", "stopReason": "end_turn"});
+        assert_eq!(
+            (SETTLE_SIGNAL.notification_prompt_id)(&notification),
+            Some("p-1")
+        );
+        assert_eq!(
+            (SETTLE_SIGNAL.notification_prompt_id)(&json!({"stopReason": "end_turn"})),
+            None,
+            "an absent promptId on the notification must read as unknown, not a match failure"
+        );
+
+        let reply = json!({"stopReason": "end_turn", "_meta": {"promptId": "p-1"}});
+        assert_eq!((SETTLE_SIGNAL.reply_prompt_id)(&reply), Some("p-1"));
+        assert_eq!(
+            (SETTLE_SIGNAL.reply_prompt_id)(&json!({"stopReason": "end_turn"})),
+            None,
+            "a reply with no _meta.promptId must read as unknown"
+        );
+        assert_eq!(
+            (SETTLE_SIGNAL.reply_prompt_id)(&notification),
+            None,
+            "the reply reader must not accidentally also match the notification's \
+             top-level promptId -- the two shapes are genuinely different"
         );
     }
 }

@@ -570,6 +570,12 @@ impl Harness for HermesHarness {
             // -- see its doc comment for why that is genuinely spec-general
             // rather than a second vendor path.
             normalize::usage,
+            // Hermes advertises nothing under `_x.ai/*` and sends no
+            // out-of-band completion notification of its own (this module's
+            // header doc) -- `None`, not a flag, is what keeps the shared
+            // turn loop's settle arm inert for it (D122,
+            // `super::session::SettleSignal`'s own doc comment).
+            None,
         ))
     }
 }
