@@ -140,9 +140,21 @@ fn absolute_home(home: PathBuf) -> Option<PathBuf> {
 ///
 /// Owned arguments because the future is handed to `DiscoveryCache` and
 /// outlives the caller's frame.
+///
+/// `live_default` is a side channel, not part of the return value:
+/// `DiscoveryCache::get` fixes this function's `Ok` type at [`Discovery`],
+/// which has no room for "and this row is the provider's own default" without
+/// reshaping a struct `claude/discovery.rs` also constructs (D72 in
+/// `docs/debt/README.md` prices that reshape against carrying the field on
+/// the wire type instead — both cost more than this does). So the one bit
+/// `Discovery` cannot carry is written here, and `codex::mod::models` reads
+/// it back once this future resolves. Left untouched on every failure path —
+/// `Unreachable`, `Unparseable`, or the surrounding timeout — so a discovery
+/// that never ran cannot look like it answered "no default."
 pub(crate) async fn discover(
     exe: PathBuf,
     home: Option<PathBuf>,
+    live_default: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<Discovery, DiscoveryFailure> {
     let Some(home) = home
         .and_then(absolute_home)
@@ -154,7 +166,13 @@ pub(crate) async fn discover(
         return Err(DiscoveryFailure::Unreachable);
     };
     match tokio::time::timeout(DISCOVERY_TIMEOUT, handshake(&exe, &home)).await {
-        Ok(result) => result,
+        Ok(Ok((discovery, default_id))) => {
+            *live_default
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = default_id;
+            Ok(discovery)
+        }
+        Ok(Err(err)) => Err(err),
         Err(_) => {
             tracing::debug!(cli = %exe.display(), "codex discovery timed out");
             Err(DiscoveryFailure::Unreachable)
@@ -195,7 +213,10 @@ pub(crate) fn build_codex_discovery_command(exe: &Path, codex_home: &Path, cwd: 
     discovery_launch(exe, codex_home, cwd).command()
 }
 
-async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailure> {
+async fn handshake(
+    exe: &Path,
+    home: &Path,
+) -> Result<(Discovery, Option<String>), DiscoveryFailure> {
     // No project settings are wanted for a session with no turn, and the
     // capture found the model list identical across working directories.
     let mut cmd = build_codex_discovery_command(exe, home, &std::env::temp_dir());
@@ -215,20 +236,27 @@ async fn handshake(exe: &Path, home: &Path) -> Result<Discovery, DiscoveryFailur
     send(&mut stdin, INITIALIZED_LINE).await?;
 
     let mut models: Vec<DiscoveredModel> = Vec::new();
+    // First page to name a default wins; every capture and every fixture
+    // scenario ever exercised names at most one, and a server naming two
+    // would leave this picking the earlier one rather than crashing.
+    let mut default_id: Option<String> = None;
     let mut cursor: Option<String> = None;
     for page in 0..MAX_PAGES {
         let id = 2 + page as u32;
         send(&mut stdin, &model_list_line(id, cursor.as_deref())).await?;
         let line = reply_to(&mut lines, id).await?;
-        let (mut page_models, next) = page_from_reply(&line)?;
+        let (mut page_models, next, page_default) = page_from_reply(&line)?;
         models.append(&mut page_models);
+        if default_id.is_none() {
+            default_id = page_default;
+        }
         match next {
             // An explicit null and an absent key both mean "no more items".
             None => {
                 // Closing stdin ends the session; `kill_on_drop` covers a CLI
                 // that ignores it.
                 drop(stdin);
-                return Ok(Discovery { models });
+                return Ok((Discovery { models }, default_id));
             }
             // The cursor is opaque and server-chosen, so nothing but this stops
             // a server that keeps handing back the same one from spinning the
@@ -324,6 +352,13 @@ struct ListedModel {
     /// `.agents/rules/optional-wire-fields.md`.
     #[serde(default)]
     input_modalities: Option<Vec<String>>,
+    /// Which row the provider itself calls the default (D72,
+    /// `docs/debt/README.md`). Absent means "this server did not say" — not
+    /// "not the default" — so it defaults to `false` and a reply where no row
+    /// carries `true` must leave catalog order untouched rather than reading
+    /// the absence as a pick. See `.agents/rules/optional-wire-fields.md`.
+    #[serde(default)]
+    is_default: bool,
 }
 
 /// An effort is an object, not a string: `{reasoningEffort, description}`.
@@ -352,11 +387,21 @@ fn to_level(raw: &str) -> Option<ReasoningLevel> {
     })
 }
 
+/// A page's models, its paging cursor, and (D72) which of its rows the
+/// provider itself called default — named because clippy's own
+/// `type_complexity` lint calls the bare 3-tuple unreadable inline.
+type ModelPage = (Vec<DiscoveredModel>, Option<String>, Option<String>);
+
 /// The single place a `model/list` page is read. Its test pins the literal
 /// bytes the server sent, not a round trip through the structs above.
-pub(crate) fn page_from_reply(
-    line: &str,
-) -> Result<(Vec<DiscoveredModel>, Option<String>), DiscoveryFailure> {
+///
+/// Returns the page's default id alongside the usual pair rather than folding
+/// it into a [`DiscoveredModel`] field: that struct is shared with
+/// `claude/discovery.rs`, which has no `isDefault` to report, and giving it an
+/// unused field there is a worse shape than carrying this one bit separately
+/// through to the caller that actually orders the catalog
+/// (`codex::catalog::order_by_live_default`).
+pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure> {
     let reply: ModelListReply =
         serde_json::from_str(line).map_err(|_| DiscoveryFailure::Unparseable)?;
     // An error reply decodes as a frame with no `result`: the server answered
@@ -364,6 +409,16 @@ pub(crate) fn page_from_reply(
     // it means our handshake stopped being accepted — a protocol change, not a
     // machine without a CLI.
     let result = reply.result.ok_or(DiscoveryFailure::Unparseable)?;
+
+    // A hidden model can still be the reported default (nothing in the schema
+    // forbids it); read before the `hidden` filter below so that case is not
+    // silently lost, even though such a model could never be promoted to the
+    // front of a picker that never lists it.
+    let default_id = result
+        .data
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.id.clone());
 
     let models = result
         .data
@@ -389,7 +444,7 @@ pub(crate) fn page_from_reply(
             }),
         })
         .collect();
-    Ok((models, result.next_cursor))
+    Ok((models, result.next_cursor, default_id))
 }
 
 #[cfg(test)]
@@ -404,13 +459,46 @@ mod tests {
     #[test]
     fn the_captured_reply_decodes_onto_curated_ids() {
         let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
-        let (models, next) = page_from_reply(&payload).expect("captured reply decodes");
+        let (models, next, default_id) = page_from_reply(&payload).expect("captured reply decodes");
         assert_eq!(next, None, "an explicit null cursor ends the paging");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids.len(), 7);
         assert_eq!(ids.first(), Some(&"gpt-5.6-sol"));
         assert_eq!(ids.last(), Some(&"gpt-5.3-codex-spark"));
         assert_eq!(models[0].label, "GPT-5.6-Sol");
+        assert_eq!(
+            default_id.as_deref(),
+            Some("gpt-5.6-sol"),
+            "the captured reply flags gpt-5.6-sol isDefault: true"
+        );
+    }
+
+    /// The wire fact this whole change reads: `isDefault` can name a row that
+    /// is not first in the reply, and not the curated flagship either. A
+    /// decoder that only ever checked `data[0]` would pass every other test
+    /// here and still get this one wrong.
+    #[test]
+    fn is_default_names_a_row_that_is_not_first() {
+        let line = r#"{"id":2,"result":{"data":[{"id":"gpt-5.6-sol","displayName":"Sol","hidden":false,"isDefault":false,"supportedReasoningEfforts":[]},{"id":"gpt-5.5","displayName":"GPT-5.5","hidden":false,"isDefault":true,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
+        let (models, _, default_id) = page_from_reply(line).expect("decodes");
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["gpt-5.6-sol", "gpt-5.5"],
+            "reply order is unchanged"
+        );
+        assert_eq!(default_id.as_deref(), Some("gpt-5.5"));
+    }
+
+    /// No row claims the default: today's whole behaviour, catalog order,
+    /// must survive. `None` is "this server did not say", not "false" for
+    /// every row — the absent-case rule `.agents/rules/optional-wire-fields.md`
+    /// names, applied to a reply that never mentions the field at all.
+    #[test]
+    fn no_row_claiming_default_reports_none() {
+        let line = r#"{"id":2,"result":{"data":[{"id":"gpt-5.6-sol","displayName":"Sol","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
+        let (_, _, default_id) = page_from_reply(line).expect("decodes");
+        assert_eq!(default_id, None);
     }
 
     /// The effort array is objects, and `ultra` is a real provider-reported
@@ -421,7 +509,7 @@ mod tests {
     #[test]
     fn efforts_decode_from_objects_including_ultra() {
         let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
-        let (models, _) = page_from_reply(&payload).expect("decodes");
+        let (models, _, _) = page_from_reply(&payload).expect("decodes");
         assert_eq!(
             models[0].reasoning_levels,
             vec![
@@ -443,7 +531,7 @@ mod tests {
     #[test]
     fn input_modalities_split_text_only_from_image_capable() {
         let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
-        let (models, _) = page_from_reply(&payload).expect("decodes");
+        let (models, _, _) = page_from_reply(&payload).expect("decodes");
         let sol = models
             .iter()
             .find(|model| model.id == "gpt-5.6-sol")
@@ -466,14 +554,14 @@ mod tests {
     #[test]
     fn an_absent_modality_list_means_images_are_supported() {
         let line = r#"{"id":2,"result":{"data":[{"id":"gpt-new","displayName":"New","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
-        let (models, _) = page_from_reply(line).expect("decodes");
+        let (models, _, _) = page_from_reply(line).expect("decodes");
         assert_eq!(models[0].accepts_images, Some(true));
     }
 
     #[test]
     fn hidden_models_are_dropped() {
         let line = r#"{"id":2,"result":{"data":[{"id":"codex-auto-review","displayName":"Auto Review","hidden":true,"supportedReasoningEfforts":[]},{"id":"gpt-5.5","displayName":"GPT-5.5","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
-        let (models, _) = page_from_reply(line).expect("decodes");
+        let (models, _, _) = page_from_reply(line).expect("decodes");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5.5"]);
     }
@@ -491,9 +579,10 @@ mod tests {
     #[test]
     fn an_explicitly_empty_list_is_an_answer() {
         let line = r#"{"id":2,"result":{"data":[],"nextCursor":null}}"#;
-        let (models, next) = page_from_reply(line).expect("decodes");
+        let (models, next, default_id) = page_from_reply(line).expect("decodes");
         assert!(models.is_empty());
         assert_eq!(next, None);
+        assert_eq!(default_id, None);
     }
 
     /// A JSON-RPC error reply carries no `result`. `-32600 Not initialized` is
@@ -508,7 +597,7 @@ mod tests {
     #[test]
     fn a_cursor_is_carried_when_the_server_sends_one() {
         let line = r#"{"id":2,"result":{"data":[],"nextCursor":"2"}}"#;
-        let (_, next) = page_from_reply(line).expect("decodes");
+        let (_, next, _) = page_from_reply(line).expect("decodes");
         assert_eq!(next.as_deref(), Some("2"));
     }
 

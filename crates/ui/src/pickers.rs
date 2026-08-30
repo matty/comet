@@ -135,9 +135,19 @@ impl ResolvedRunConfig {
 // Pure: default resolution (no "Default" placeholders — a concrete pick always)
 // ---------------------------------------------------------------------------
 
-/// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — comet's `pickDefaultModel` Opus preference maps to
-/// the same row here).
+/// The harness's default model: the first catalog row. For a built-in list,
+/// or for Claude's live one, that is catalog order — both curated catalogs
+/// lead with the flagship, and comet's `pickDefaultModel` Opus preference maps
+/// to the same row here.
+///
+/// Codex's live `model/list` answer is different: it carries its own
+/// `isDefault` per row, and `codex::catalog::order_by_live_default` (D72,
+/// `docs/debt/README.md`) has already moved that row to the front of the
+/// merged catalog before it ever reaches here. So "first row" is no longer a
+/// synonym for "catalog order" unconditionally — it is catalog order unless a
+/// live discovery named a different default, in which case it is that.
+/// `models.first()` stays the single source of truth either way; only what
+/// "first" can mean has grown.
 pub fn default_model(models: &[Model]) -> Option<&Model> {
     models.first()
 }
