@@ -3843,7 +3843,7 @@
     "a46b7010e67c4765482c086a801ba106f35db495": {
       "decision_date": "2026-08-30",
       "local_commit": "02a6dc5c174fe31545c3b14d9f885f8350dfe047",
-      "note": "Cherry-picked by upstream sync helper.",
+      "note": "Adapted to current Comet card parity: Grok lifecycle emits SubagentStarted/SubagentUpdated and final wire output; upstream private disk tail, child documents, and tabs are not applicable because D54 deliberately keeps that architecture open and ACP must not outrun native providers.",
       "outcome": "implemented",
       "subject": "grok: subagent visualization over ACP \u2014 lifecycle wire events + disk-tailed transcripts",
       "upstream_sha": "a46b7010e67c4765482c086a801ba106f35db495"
@@ -44269,7 +44269,7 @@
         },
         {
           "local_commit": "02a6dc5c174fe31545c3b14d9f885f8350dfe047",
-          "note": "Cherry-picked by upstream sync helper.",
+          "note": "Adapted to current Comet card parity: Grok lifecycle emits SubagentStarted/SubagentUpdated and final wire output; upstream private disk tail, child documents, and tabs are not applicable because D54 deliberately keeps that architecture open and ACP must not outrun native providers.",
           "outcome": "implemented",
           "subject": "grok: subagent visualization over ACP \u2014 lifecycle wire events + disk-tailed transcripts",
           "upstream_sha": "a46b7010e67c4765482c086a801ba106f35db495"
