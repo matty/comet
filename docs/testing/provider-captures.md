@@ -6,6 +6,62 @@ The harness corpus preserves reviewed provider evidence under
 sequence number, from the literal payload bytes, never a round trip through Comet's own wire
 types.
 
+Everything from here through "Promote" is one stage of a two-stage pipeline: **Promote**, which
+turns a *known* shape into corpus evidence through a closed, named scenario list. The other
+stage, **Explore**, is what comes before you know the shape — read it first if you are about to
+run an arbitrary prompt against a real CLI to find out what it does, rather than to back an
+assertion you have already designed.
+
+## Exploratory captures (D63)
+
+A named `comet-provider-capture` scenario can only be written once you already know what you are
+looking for: naming one means committing to a prompt, an expected frame shape, and usually an
+evidence guard. That is the output of an investigation, not its input. An **exploratory**
+capture is the opposite — an arbitrary prompt against the real CLI, run to find out what it does,
+with no scenario to write into yet.
+
+That capture is legitimate, and it is not a shortcut around anything below. Run it with a rig
+outside this crate (the per-slice Python rigs this repository's agents have used since phase 2.2
+are the usual tool; a one-off script works too) against a disposable, non-repository directory,
+observing the same model-cost and safety discipline as "Safety boundary" below. Its raw output
+belongs under `.comet-provider-captures/` (ignored by Git) or entirely outside the repository —
+never under `crates/capture/tests/corpus/`, and the two prohibitions below apply to it exactly as
+they apply to a named scenario's raw output.
+
+**Sanitizing is not optional for it.** An exploratory capture is raw provider output like any
+other and may carry anything; if any of it is going to persist anywhere reachable, it goes
+through the real `comet-provider-sanitize`, the same allowlist, the same rules, with no separate
+looser pass for "this one's just exploratory."
+
+Three outcomes, and only one of them touches the corpus:
+
+- **Nothing worth keeping.** The question is answered, nobody needs the capture again. Delete the
+  raw output. This is the common case and needs no further step.
+- **Worth keeping for the next person, but not yet corpus evidence.** If the finding is a
+  decision, a ruling, or a gap with no capture behind it, write it up in `docs/debt/` the way
+  D58, D102 and D104 already do — that is the established, working home for a finding, and it
+  needs no data alongside it. If a sanitized fragment of the capture is itself worth keeping as
+  supporting evidence, put it under `crates/capture/tests/exploratory/<short-name>/` instead
+  (`comet_capture::exploratory_root()`), following that directory's own `README.md`. It is a
+  sibling of `tests/corpus/`, not a subtree of it, so nothing that walks the corpus —
+  `promoted_scenarios()`, the capability sheet golden test, the allowlist property tests, the
+  decode coverage lints, the version floor and coverage policy — ever reaches it; every one of
+  them is built on `corpus_root()`, and none of them is given `exploratory_root()` instead. Every
+  entry there additionally carries a file named exactly `NOT-CORPUS-EVIDENCE.md`
+  (`comet_capture::EXPLORATORY_MARKER_FILENAME`), pinned by
+  `crates/capture/tests/exploratory_boundary.rs`, so an entry copied out of context by hand still
+  announces what it is instead of relying on which directory it currently sits in.
+- **Worth a permanent scenario.** Write the scenario the finding justifies into
+  `crates/capture/src/record/scenarios.rs`, then re-capture through `comet-provider-capture` and
+  run the unchanged Capture → Sanitize → Review → Promote pipeline below on that new recording.
+  **Promoting is never a copy from `tests/exploratory/` into `tests/corpus/`** — an exploratory
+  capture, sanitized fragment or not, is not itself promotable; only a recording made through a
+  named scenario is, because only that recording carries the reproducible command, purpose and
+  requirements a promoted entry is expected to have. Re-capturing costs a second live turn even
+  when the exploratory capture already answered the question — that cost is deliberate, not
+  friction to engineer around, because it is what keeps every promoted entry traceable to a named,
+  reproducible scenario rather than to whatever an ad hoc rig happened to run.
+
 ## Safety boundary
 
 Raw and staging data belong only under `.comet-provider-captures/`, which is ignored by Git. Never

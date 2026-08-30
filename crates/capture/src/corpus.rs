@@ -36,6 +36,31 @@ pub fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
 }
 
+/// The fixed filename an exploratory capture entry carries beside any evidence it keeps, so the
+/// entry can never be mistaken for promoted corpus evidence by inspection alone — not the
+/// directory it happens to sit in, a single named file with fixed content
+/// (`docs/testing/provider-captures.md`'s "Exploratory captures" section states what it says).
+/// A guard test can grep for this name specifically instead of inferring "exploratory" from a
+/// path convention that a copy-paste could silently violate.
+///
+/// D63: a capture recorded to answer a question, not to back a scenario, still needs somewhere
+/// to live that nothing downstream mistakes for evidence — a capability sheet, a decode
+/// coverage lint, or the version floor all treat everything under [`corpus_root`] as reviewed.
+pub const EXPLORATORY_MARKER_FILENAME: &str = "NOT-CORPUS-EVIDENCE.md";
+
+/// `tests/exploratory`, the sibling of [`corpus_root`] that holds a written-up exploratory
+/// finding and, optionally, the sanitized raw evidence behind it (D63).
+///
+/// Never a subtree of [`corpus_root`] and never walked by [`promoted_scenarios`] or anything
+/// built on it — [`promoted_scenarios`] only ever descends from the path it is given, and every
+/// caller in this crate gives it [`corpus_root`], never this function. That is what makes the
+/// separation structural rather than a naming convention: nothing here can enter a capability
+/// sheet, an allowlist property test, the coverage policy, or the version floor, because none of
+/// those walk this directory at all, not because they filter it out once they arrive.
+pub fn exploratory_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/exploratory")
+}
+
 /// One promoted scenario directory: `provider/version/scenario`, holding its
 /// own `events.jsonl`.
 #[derive(Clone, Debug)]

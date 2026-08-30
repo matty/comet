@@ -1,6 +1,6 @@
 # D63 — the corpus pipeline has no route for an exploratory capture
 
-**Status:** open. Not a defect in either tool; a gap in what the doc describes.
+**Status:** resolved. Not a defect in either tool; a gap in what the doc described.
 
 ## What happens
 
@@ -78,3 +78,32 @@ review step that looks at values rather than at placeholder counts.
 - **D60** — the scenario name is duplicated across three unsynchronized places, which is friction
   in the "write the scenario" step this page recommends.
 - **D61** — a scenario's evidence guard and its prompt live in different files.
+
+## Resolution, 2026-08-30
+
+Built exactly the shape "What would close it" proposed: `docs/testing/provider-captures.md` now
+names two stages, Explore and Promote, with the prohibitions unchanged and Promote's pipeline
+untouched. What "explore with a rig" resolves to concretely is unchanged from what 4.2 already
+did — this closes the doc gap, not a tooling gap; the rig and the sanitizer were never the
+problem.
+
+The one addition beyond the doc: a **third outcome** for a finding worth keeping but not yet
+corpus evidence, which the original "what would close it" draft did not name — a sanitized
+fragment can live in a new sibling directory, `crates/capture/tests/exploratory/`
+(`comet_capture::exploratory_root()`), never a subtree of `tests/corpus/`, so nothing that walks
+the corpus (`promoted_scenarios()`, the capability sheet, the allowlist property tests, decode
+coverage, the version floor and coverage policy — all built on `corpus_root()`) can ever reach
+it structurally. Every entry there carries a fixed marker file,
+`NOT-CORPUS-EVIDENCE.md` (`comet_capture::EXPLORATORY_MARKER_FILENAME`), so a copy taken out of
+context still announces what it is. `crates/capture/tests/exploratory_boundary.rs` pins both
+halves: the destination exists and is never nested with the corpus, and neither tree ever holds
+the other's evidence unmarked. This directory is for a sanitized fragment worth keeping as
+supporting evidence only — a finding that is a decision, ruling, or gap with no capture behind it
+still belongs in `docs/debt/` the way D58, D102 and D104 already do, with nothing added here.
+
+Deliberately NOT built: a new "exploratory" scenario kind on `comet-provider-capture` accepting
+an arbitrary prompt. That would have let one capture serve both stages, but it would also blur
+the one property Promote depends on — that a promoted entry's command, purpose and requirements
+come from a named, reviewed row in `record::scenarios::SCENARIOS`, not from whatever an operator
+typed that day. 4.3's double-capture cost (the same finding recorded twice) is accepted as the
+honest price of keeping that property, not a residual gap.
