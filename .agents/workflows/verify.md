@@ -61,6 +61,32 @@ the wrong version with a note on why it misled. A wrong explanation that sounds
 right is what costs the next person their afternoon — the failure's symptom
 routinely names the wrong culprit.
 
+## Writing a test that waits
+
+**Wait on the condition; sleep only to prove absence.** A test that sleeps past
+a deadline puts its own correctness in the margin — `sleep(400ms)` against a
+300ms grace has 100ms of slack, and under load an orphan stamp landing late
+leaves the next pass short of the grace, so the test fails about code that is
+right. Poll the condition with a generous deadline instead: the deadline only
+ever bounds a FAILURE, so it costs nothing when the code works, and there is no
+margin to get wrong. `diff_sync_churn.rs`'s `wait_for_eviction` and
+`wait_chat_state` are the shape.
+
+Two things that keep a poll honest:
+
+- **Keep the negative half.** "Eventually gone" passes just as happily against
+  a grace of zero, so assert first that one pass BEFORE the deadline does not
+  remove the entry. That half is what makes the wait a test of the grace rather
+  than of the loop.
+- **A fixed sleep is still right for proving a NON-event** ("nothing was
+  re-published"), because there is no condition to wait for. Accept that it
+  proves absence only within the window it waits, and say so where it sits.
+
+Three rows in this family are already recorded — `docs/debt/README.md`'s D89,
+D126 and D129 — each a budget sized on the machine that wrote it. The pattern
+is worth naming: an idle developer machine is the least representative one this
+code runs on.
+
 ## When the change touches `edge/`
 
 ```bash
