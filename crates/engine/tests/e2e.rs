@@ -4164,7 +4164,7 @@ async fn the_spawned_sweeper_expires_a_parked_approval_on_its_own() {
     let _sweeper = comet_engine::spawn_unattended_sweeper(
         core.sessions.clone(),
         presence,
-        Duration::from_millis(100),
+        comet_engine::UnattendedBound(Duration::from_millis(100)),
     );
 
     drive_to_open_approval(&core, &handle, "cmd-run-real-sweeper").await;

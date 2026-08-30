@@ -179,10 +179,38 @@ pub fn due_for_expiry(
     }
 }
 
+/// The deadline a parked wait may not outlive — `COMET_UNATTENDED_TIMEOUT_SECS`,
+/// default 24 hours.
+///
+/// **A newtype so the sweeper's two durations cannot be swapped** (D27). The
+/// spawn site passes a BOUND and derives a CADENCE from it, and both are
+/// `Duration`: passing `sweep_interval(bound)` where the bound belongs, or the
+/// reverse, type-checked and no test could catch it. Both orderings expire a
+/// parked approval well inside any test's assertion window at test scale,
+/// because `sweep_interval` clamps — it returns something smaller than its
+/// input only above 250ms, exactly equal at 250ms, and larger below it, and
+/// 100ms is the bound the covering test uses. Distinguishing them would need a
+/// "not expired at T, expired at T+ε" assertion, which is the flake this
+/// module's real-wall-clock design exists to avoid.
+///
+/// The type removes the mistake instead of testing for it: `sweep_interval`
+/// takes an `UnattendedBound` and returns a plain `Duration`, so its own output
+/// cannot travel back into a bound position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnattendedBound(pub Duration);
+
+impl UnattendedBound {
+    /// The wrapped deadline, for the arithmetic that genuinely needs a
+    /// `Duration` — `chrono` conversion and the humanizer.
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
 /// How often the sweeper wakes. A quarter of the bound, clamped so the default
 /// costs one wakeup a minute and a test bound of 100ms is still observable.
-pub fn sweep_interval(bound: Duration) -> Duration {
-    (bound / 4).clamp(Duration::from_millis(250), Duration::from_secs(60))
+pub fn sweep_interval(bound: UnattendedBound) -> Duration {
+    (bound.get() / 4).clamp(Duration::from_millis(250), Duration::from_secs(60))
 }
 
 /// Largest whole unit that fits, so a 30-second override reads honestly in the
@@ -224,6 +252,39 @@ pub fn unattended_note(bound: Duration, waited_on: WaitKind) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D27): `spawn_unattended_sweeper` took a bare `Duration`
+    /// for its bound and derived the cadence from it with `sweep_interval`,
+    /// which also returns a bare `Duration` — so passing the cadence where the
+    /// bound belongs, or the reverse, type-checked. No test could catch it
+    /// either: `sweep_interval` clamps, so at test scale a bound of B and a
+    /// bound of `sweep_interval(B)` both expire inside the same observable
+    /// moment.
+    ///
+    /// The type is the guard, and this asserts the clamp behaviour that made
+    /// the mistake invisible rather than the type itself — the compiler proves
+    /// the type. `sweep_interval(100ms) == 250ms` is LARGER than its input,
+    /// which is why swapping the two arguments changed nothing a test could
+    /// see.
+    #[test]
+    fn the_sweep_cadence_is_clamped_which_is_why_a_swap_was_invisible() {
+        assert_eq!(
+            sweep_interval(UnattendedBound(Duration::from_millis(100))),
+            Duration::from_millis(250),
+            "below the floor the cadence is LARGER than the bound it came from"
+        );
+        assert_eq!(
+            sweep_interval(UnattendedBound(Duration::from_millis(1000))),
+            Duration::from_millis(250),
+            "and exactly at the floor for a bound of 1s"
+        );
+        assert_eq!(
+            sweep_interval(UnattendedBound(Duration::from_secs(24 * 60 * 60))),
+            Duration::from_secs(60),
+            "the default costs one wakeup a minute"
+        );
+    }
+
     use super::*;
 
     fn t(secs: i64) -> DateTime<Utc> {
@@ -320,11 +381,13 @@ mod tests {
     #[test]
     fn sweep_interval_is_cheap_at_the_default_and_quick_in_tests() {
         assert_eq!(
-            sweep_interval(Duration::from_secs(DEFAULT_UNATTENDED_TIMEOUT_SECS)),
+            sweep_interval(UnattendedBound(Duration::from_secs(
+                DEFAULT_UNATTENDED_TIMEOUT_SECS
+            ))),
             Duration::from_secs(60)
         );
         assert_eq!(
-            sweep_interval(Duration::from_millis(100)),
+            sweep_interval(UnattendedBound(Duration::from_millis(100))),
             Duration::from_millis(250)
         );
     }
