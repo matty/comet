@@ -604,6 +604,19 @@ pub(crate) fn log_budget(discriminator: &str) -> LogBudget {
     let mut seen = SEEN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    log_budget_in(&mut seen, discriminator)
+}
+
+/// The rule itself, over a caller's own table.
+///
+/// Split out so the tests own their state: the wrapper above is process-global,
+/// and two tests sharing it made one of them depend on whether the other had
+/// run — the exact in-process coupling `ADAPTER_ROOT_ENV_LOCK` exists to avoid
+/// elsewhere. Nothing in production calls this directly.
+fn log_budget_in(
+    seen: &mut std::collections::HashMap<String, u64>,
+    discriminator: &str,
+) -> LogBudget {
     // Past the key cap an unseen discriminator is counted as one past the
     // budget rather than inserted: bounding the table is the point, and
     // `CountOnly` still logs it — the discriminator itself is short and fixed,
@@ -1379,20 +1392,21 @@ mod probe_tests {
     /// so an operator can still see the volume.
     #[test]
     fn a_repeated_discriminator_stops_carrying_its_payload() {
+        let mut seen = std::collections::HashMap::new();
         let key = "test/one-loud-frame";
         for expected in 1..=FULL_FIDELITY_LOGS {
             assert_eq!(
-                log_budget(key),
+                log_budget_in(&mut seen, key),
                 LogBudget::Full,
                 "occurrence {expected} is still diagnosable in full"
             );
         }
         assert_eq!(
-            log_budget(key),
+            log_budget_in(&mut seen, key),
             LogBudget::CountOnly(FULL_FIDELITY_LOGS + 1)
         );
         assert_eq!(
-            log_budget(key),
+            log_budget_in(&mut seen, key),
             LogBudget::CountOnly(FULL_FIDELITY_LOGS + 2)
         );
     }
@@ -1403,11 +1417,12 @@ mod probe_tests {
     /// raise.
     #[test]
     fn a_discriminator_past_the_key_cap_still_logs_without_its_payload() {
+        let mut seen = std::collections::HashMap::new();
         for i in 0..MAX_TRACKED_LOG_KEYS {
-            let _ = log_budget(&format!("test/fill-{i}"));
+            let _ = log_budget_in(&mut seen, &format!("test/fill-{i}"));
         }
         assert_eq!(
-            log_budget("test/one-too-many"),
+            log_budget_in(&mut seen, "test/one-too-many"),
             LogBudget::CountOnly(FULL_FIDELITY_LOGS + 1),
             "past the cap nothing new is tracked, and nothing new is silent"
         );

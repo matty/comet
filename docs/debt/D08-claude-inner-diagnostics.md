@@ -1,5 +1,20 @@
 # D8 — Claude's inner catch-alls reach none of the three tiers
 
+**CLOSED 2026-08-30, with the fix shape this page ends on.** `INNER_IGNORED` is the small named
+list (structural `content_block_start`/`stop`, the message framing, `ping`, the opaque
+`signature_delta`, and the buffered `text`/`thinking` blocks whose streamed halves are already
+claimed), and everything else produces a `delta/<kind>`, `stream_event/<kind>` or `block/<kind>`
+diagnostic through `Normalizer::inner_diagnostic`.
+
+**Once per RUN, not once per frame**, which is the one thing this page did not say and the
+implementation has to: these arrive inside streamed deltas, so an unrecognized delta kind on a
+long tool input would otherwise journal and broadcast one event per chunk. The set is capped at
+32 distinct kinds for the reason `acp::normalize`'s `MAX_TRACKED_UPDATE_KINDS` gives — the key
+is provider-chosen.
+
+The original note follows.
+
+
 0b.2 gave Codex an **inner** sink: `map_item`'s `other =>` arm turns an
 unrecognized item type inside the *claimed* `item/started`/`item/completed`
 notifications into an `item/<type>` diagnostic. Claude has no equivalent.
