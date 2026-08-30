@@ -41,10 +41,46 @@ pub(crate) enum Incoming {
     },
     /// stdout EOF: the app server exited. All pending requests fail.
     Eof,
-    /// A stdout line that was not a JSON-RPC message: non-JSON, or JSON with
-    /// neither `method` nor `id`. Sink 5 — the session loop records it. The
-    /// raw line stays in tracing at the drop site.
-    Malformed,
+    /// A stdout line that was not a JSON-RPC message. Sink 5 — the session
+    /// loop records it. The raw line stays in tracing at the drop site; only
+    /// the KIND travels, because the line is provider text.
+    Malformed(MalformedKind),
+}
+
+/// Which way a stdout line failed to be a JSON-RPC message.
+///
+/// **The reader always knew this and used to throw it away** (D9): all three
+/// arms below sent one bare `Malformed`, so an operator read `unparseable ×412`
+/// and could not tell a CLI writing log noise to stdout from one whose message
+/// shape changed. The distinction costs nothing — each arm already logs a
+/// different sentence — and it is the difference between "something else is
+/// writing to this pipe" and "the protocol moved".
+// Every variant names a way of NOT being a message, so the shared prefix is the
+// honest reading rather than a naming slip — `Json`/`Object`/`Message` would
+// each say the opposite of what the variant means.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MalformedKind {
+    /// Not JSON at all. The bare sentinel: this is what "unparseable" has
+    /// always meant, and the one case where nothing more can be said.
+    NotJson,
+    /// Valid JSON, but not an object — a bare string or array on stdout.
+    NotAnObject,
+    /// A JSON object with neither `method` nor `id`, so it is neither a
+    /// request, a response, nor a notification.
+    NotAMessage,
+}
+
+impl MalformedKind {
+    /// The diagnostic discriminator. Fixed strings, never provider text, so
+    /// nothing here can mint an unbounded vocabulary.
+    pub(crate) fn discriminator(self) -> &'static str {
+        match self {
+            Self::NotJson => crate::UNPARSEABLE,
+            Self::NotAnObject => "unparseable/not-an-object",
+            Self::NotAMessage => "unparseable/not-a-message",
+        }
+    }
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcFailure>>>>>;
@@ -188,7 +224,11 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                 line,
                 "non-JSON stdout line (recorded as a diagnostic)"
             );
-            if tx.send(Incoming::Malformed).await.is_err() {
+            if tx
+                .send(Incoming::Malformed(MalformedKind::NotJson))
+                .await
+                .is_err()
+            {
                 return;
             }
             continue;
@@ -205,7 +245,11 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     frame = %other,
                     "not a JSON-RPC message (recorded as a diagnostic)"
                 );
-                if tx.send(Incoming::Malformed).await.is_err() {
+                if tx
+                    .send(Incoming::Malformed(MalformedKind::NotAnObject))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 continue;
@@ -262,7 +306,11 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     %frame,
                     "not a JSON-RPC message (recorded as a diagnostic)"
                 );
-                if tx.send(Incoming::Malformed).await.is_err() {
+                if tx
+                    .send(Incoming::Malformed(MalformedKind::NotAMessage))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }

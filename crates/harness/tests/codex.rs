@@ -1005,9 +1005,15 @@ async fn unclaimed_notifications_items_and_requests_surface_as_diagnostics() {
         diagnostics,
         vec![
             // sink 5: a non-JSON line, then a JSON frame with neither
-            // `method` nor `id` — both the Malformed sentinel.
+            // `method` nor `id`. Both are Malformed and they no longer share
+            // one sentinel (D9) — an operator reading `unparseable x412` could
+            // not tell a CLI writing log noise to stdout from one whose
+            // message shape moved.
             ("unparseable".to_string(), DiagnosticSeverity::Malformed),
-            ("unparseable".to_string(), DiagnosticSeverity::Malformed),
+            (
+                "unparseable/not-a-message".to_string(),
+                DiagnosticSeverity::Malformed,
+            ),
             // sink 2: an unknown notification method, verbatim.
             (
                 "thread/checkpoint/created".to_string(),

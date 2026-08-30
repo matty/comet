@@ -603,7 +603,7 @@ async fn run_session(session: Session) {
                                 "unparseable frame (recorded as a diagnostic): {e}"
                             );
                             let ev = crate::diagnostic(
-                                crate::UNPARSEABLE,
+                                &e.discriminator(),
                                 DiagnosticSeverity::Malformed,
                             );
                             if event_tx.send(Ok(ev)).await.is_err() {

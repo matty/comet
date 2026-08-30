@@ -1765,8 +1765,8 @@ async fn handle_incoming(
             Handled::Continue
         }
 
-        Incoming::Malformed => {
-            let ev = crate::diagnostic(crate::UNPARSEABLE, DiagnosticSeverity::Malformed);
+        Incoming::Malformed(kind) => {
+            let ev = crate::diagnostic(kind.discriminator(), DiagnosticSeverity::Malformed);
             if send(event_tx, ev).await {
                 Handled::Continue
             } else {

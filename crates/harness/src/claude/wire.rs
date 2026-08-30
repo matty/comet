@@ -437,9 +437,71 @@ pub(crate) struct ControlRequestBody {
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unclaimed types classify
 /// via [`classify_unclaimed`].
-pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
-    let value: Value = serde_json::from_str(line)?;
-    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+/// Why a Claude stdout line did not become a [`Frame`].
+///
+/// **Two different failures used to share one sentinel** (D9). A line that is
+/// not JSON and a line whose TYPED decode failed are different problems: the
+/// second means a frame Comet knows about changed shape, and for a `result`
+/// frame it means no `Done` ever fires — the original missing-output symptom.
+/// An operator reading `unparseable x412` learned neither.
+///
+/// The frame's own `type` is free at the failure site: the line already parsed
+/// as generic JSON, so the discriminator can name it.
+#[derive(Debug)]
+pub(crate) struct FrameParseError {
+    /// The frame's `type`, when the line was JSON and only the typed decode
+    /// failed. `None` for a line that was never JSON.
+    pub(crate) kind: Option<String>,
+    pub(crate) error: serde_json::Error,
+}
+
+impl FrameParseError {
+    fn not_json(error: serde_json::Error) -> Self {
+        Self { kind: None, error }
+    }
+
+    fn typed(kind: &str, error: serde_json::Error) -> Self {
+        Self {
+            kind: Some(kind.to_owned()),
+            error,
+        }
+    }
+
+    /// The diagnostic discriminator: the bare sentinel for input that was never
+    /// JSON, and `unparseable/<type>` when a known frame kind failed to decode.
+    ///
+    /// The type is provider-controlled, so it goes through
+    /// `sanitize_discriminator` like every other value that crosses into a
+    /// discriminator — a CLI is free to send anything there.
+    pub(crate) fn discriminator(&self) -> String {
+        match &self.kind {
+            None => crate::UNPARSEABLE.to_owned(),
+            Some(kind) => {
+                comet_proto::sanitize_discriminator(&format!("{}/{kind}", crate::UNPARSEABLE))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+pub(crate) fn parse_frame(line: &str) -> Result<Frame, FrameParseError> {
+    let value: Value = serde_json::from_str(line).map_err(FrameParseError::not_json)?;
+    // Owned rather than borrowed: every arm below moves `value` into
+    // `from_value`, and the failure needs the kind afterwards.
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let kind = kind.as_str();
+    // Every `?` below is a TYPED decode failure on a line that already parsed,
+    // so the frame's own `type` is in hand and travels with the error (D9).
+    let typed = |error: serde_json::Error| FrameParseError::typed(kind, error);
     let frame = match kind {
         "system" => {
             let subtype = value
@@ -448,12 +510,12 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
                 .unwrap_or("")
                 .to_owned();
             match subtype.as_str() {
-                "init" => Frame::System(serde_json::from_value(value)?),
+                "init" => Frame::System(serde_json::from_value(value).map_err(typed)?),
                 s if NOTICE_SUBTYPES.contains(&s) => {
-                    Frame::SystemNotice(serde_json::from_value(value)?)
+                    Frame::SystemNotice(serde_json::from_value(value).map_err(typed)?)
                 }
                 s if SUBAGENT_TASK_SUBTYPES.contains(&s) => {
-                    Frame::SubagentTask(serde_json::from_value(value)?)
+                    Frame::SubagentTask(serde_json::from_value(value).map_err(typed)?)
                 }
                 s => {
                     let discriminator = format!("system/{s}");
@@ -461,12 +523,12 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
                 }
             }
         }
-        "stream_event" => Frame::StreamEvent(serde_json::from_value(value)?),
-        "assistant" => Frame::Assistant(serde_json::from_value(value)?),
-        "user" => Frame::User(serde_json::from_value(value)?),
-        "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
-        "result" => Frame::Result(serde_json::from_value(value)?),
-        "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+        "stream_event" => Frame::StreamEvent(serde_json::from_value(value).map_err(typed)?),
+        "assistant" => Frame::Assistant(serde_json::from_value(value).map_err(typed)?),
+        "user" => Frame::User(serde_json::from_value(value).map_err(typed)?),
+        "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value).map_err(typed)?),
+        "result" => Frame::Result(serde_json::from_value(value).map_err(typed)?),
+        "control_request" => Frame::ControlRequest(serde_json::from_value(value).map_err(typed)?),
         kind => classify_unclaimed(kind.to_owned(), &value),
     };
     Ok(frame)
@@ -569,6 +631,71 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Break caught (D9): both failures below produced the same bare
+    /// `unparseable`, so `unparseable x412` told an operator nothing about
+    /// which frame — and for a `result` frame a typed decode failure is the
+    /// missing-`Done` symptom the whole diagnostic exists to explain.
+    #[test]
+    fn a_typed_decode_failure_names_the_frame_it_failed_on() {
+        // Valid JSON, known `type`, and `subtype: "init"` decodes into a
+        // struct this payload cannot satisfy.
+        let line = r#"{"type":"system","subtype":"init","tools":"not-an-array"}"#;
+        let err = parse_frame(line).expect_err("a system/init with a string `tools` cannot decode");
+        assert_eq!(err.kind.as_deref(), Some("system"));
+        assert_eq!(err.discriminator(), "unparseable/system");
+    }
+
+    /// The other half, unchanged: a line that was never JSON keeps the bare
+    /// sentinel, because there is genuinely nothing more to say about it.
+    #[test]
+    fn a_line_that_is_not_json_keeps_the_bare_sentinel() {
+        let err = parse_frame("Debugger listening on ws://127.0.0.1:9229")
+            .expect_err("log noise on stdout is not a frame");
+        assert_eq!(err.kind, None);
+        assert_eq!(err.discriminator(), "unparseable");
+    }
+
+    /// **An unrecognized `type` never reaches this path**, which bounds the
+    /// discriminator vocabulary without needing a cap: an unknown kind falls to
+    /// `classify_unclaimed` and becomes `Frame::Unknown`, so the only types
+    /// that can fail a TYPED decode are the handful this function names
+    /// (`system`, `assistant`, `result`, …). `sanitize_discriminator` is still
+    /// applied in `discriminator()` as defence, and this test is the record
+    /// that nothing today can exercise it.
+    #[test]
+    fn an_unrecognized_frame_type_becomes_unknown_rather_than_a_parse_failure() {
+        let line = r#"{"type":"a b/c d","message":42}"#;
+        let frame = parse_frame(line).expect("an unknown type is classified, not rejected");
+        assert!(
+            matches!(frame, Frame::Unknown { .. }),
+            "an unknown type must not reach the parse-failure discriminator: {frame:?}"
+        );
+    }
+
+    /// Every discriminator this path CAN mint, from the closed set of types the
+    /// parser knows. Reads as the operator would see it.
+    #[test]
+    fn a_failed_typed_decode_names_only_a_known_frame_kind() {
+        for (line, expected) in [
+            (
+                r#"{"type":"system","subtype":"init","tools":"not-an-array"}"#,
+                "unparseable/system",
+            ),
+            (
+                r#"{"type":"assistant","message":7}"#,
+                "unparseable/assistant",
+            ),
+            (
+                r#"{"type":"stream_event","event":7}"#,
+                "unparseable/stream_event",
+            ),
+        ] {
+            let err = parse_frame(line).expect_err("a known type with a bad payload");
+            assert_eq!(err.discriminator(), expected);
+        }
+    }
+
     use super::*;
     use comet_capture::corpus_frame;
 
