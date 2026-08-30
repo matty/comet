@@ -419,6 +419,151 @@ async fn an_interrupt_a_silent_agent_ignores_still_ends_the_run() {
     }
 }
 
+/// Whether a pid still names a live process. Existence-only: neither branch
+/// sends a real signal, and both treat "cannot even ask" as "gone" — the
+/// conservative direction for a test that means to prove absence. Identical
+/// to `codex.rs`'s own copy of this helper (D46) — kept per-file rather than
+/// shared, the same way that suite's copy stands alone.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is `kill(2)`'s documented existence probe — it delivers
+    // nothing, it only reports whether the pid (or, negative, the process
+    // group) could be signaled.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: plain read-only handle open plus a zero-timeout wait, both
+    // documented, non-mutating queries; the handle is closed on every path.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let status = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        status == WAIT_TIMEOUT
+    }
+}
+
+/// Poll rather than sleep-then-check: reaping a process tree can race the
+/// harness's own teardown, and a bare sleep either flakes under load or (D89)
+/// has its budget quietly outgrown by one. This gives a real failure message
+/// instead of a timeout with no evidence attached.
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_is_alive(pid) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "pid {pid} was still alive after {}ms",
+                timeout.as_millis()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A cheap, dependency-free per-process disambiguator for the pid-file path —
+/// parallel `cargo nextest` runs already separate by `std::process::id()`,
+/// this only needs to also separate repeated runs within one process (a
+/// retried test).
+fn uuid_ish() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// D133: the ACP analogue of `codex.rs`'s
+/// `cancellation_reaps_a_provider_owned_grandchild`. `an_interrupt_a_silent_
+/// agent_ignores_still_ends_the_run` above only ever had the direct fixture
+/// process to reap — it proves the client's bounded give-up ends the RUN, not
+/// that the whole provider-owned process TREE is gone. `wedge-with-child` (in
+/// `fake_acp.rs`) spawns a real OS grandchild, records both pids to a file,
+/// then goes silent and deaf exactly like `ignore-cancel`. After
+/// cancellation, both pids must be gone — before this fix, Windows had no
+/// `ProcessTreeJob` attached at this adapter's spawn site, so only the direct
+/// fixture pid was ever reaped and the grandchild outlived it.
+#[tokio::test]
+async fn cancellation_reaps_a_provider_owned_grandchild() {
+    let (controls, _steer, token) = controls();
+
+    let pid_file = std::env::temp_dir().join(format!(
+        "comet-d133-acp-grandchild-pids-{}-{}.txt",
+        std::process::id(),
+        uuid_ish()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let mut stream = comet_harness::acp::session::run(
+        open(false).await,
+        HarnessId::Mock,
+        request(&format!("wedge-with-child|{}", pid_file.display())),
+        controls,
+        no_usage,
+        Some(settle_signal()),
+    );
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("cancellation completed in time");
+
+    match only_done(&events) {
+        AgentEvent::Done { status, .. } => assert_eq!(*status, DoneStatus::Interrupted),
+        other => unreachable!("{events:?}, got {other:?}"),
+    }
+
+    // Written before the fixture ever emits the "working" delta that
+    // triggers cancellation above, so it is guaranteed present by now.
+    let recorded = std::fs::read_to_string(&pid_file).expect("fixture recorded both pids");
+    let _ = std::fs::remove_file(&pid_file);
+    let mut pids = recorded.lines();
+    let child_pid: u32 = pids
+        .next()
+        .expect("direct child pid line")
+        .trim()
+        .parse()
+        .expect("direct child pid parses");
+    let grandchild_pid: u32 = pids
+        .next()
+        .expect("grandchild pid line")
+        .trim()
+        .parse()
+        .expect("grandchild pid parses");
+
+    wait_for_process_exit(child_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| panic!("direct child (fixture) {msg}"));
+
+    // The actual claim this row exists to prove: a provider-owned descendant
+    // does not outlive the cancelled run just because the direct child did.
+    wait_for_process_exit(grandchild_pid, Duration::from_secs(5))
+        .await
+        .unwrap_or_else(|msg| {
+            panic!(
+                "provider-owned grandchild (pid {grandchild_pid}) {msg} — \
+                 cancellation reaped the fixture but leaked its child"
+            )
+        });
+}
+
 /// Break caught: settling only on the RPC response. Upstream reports Grok's
 /// `session/prompt` RPC hanging silently after a turn really finished; the
 /// notification is what ends the turn there. Measured here at 3ms ahead of the
