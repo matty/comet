@@ -50,6 +50,7 @@
 //! above; re-run it against a newer Grok build before assuming this finding
 //! still holds.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -64,7 +65,9 @@ use comet_proto::{
 };
 
 use super::AgentDescription;
-use super::session::{AcpSession, Discovered, SettleSignal, Timeouts};
+use super::session::{
+    AcpSession, Discovered, NotificationObservation, NotificationObserver, SettleSignal, Timeouts,
+};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use crate::launch::{LaunchDescriptor, StdioMode};
 use crate::{Harness, HarnessError, RunControls};
@@ -407,6 +410,75 @@ fn announcement_notices(method: &str, params: &Value) -> Vec<AgentEvent> {
             })
         })
         .collect()
+}
+
+/// Grok's single provider-owned observer for vendor notifications.
+///
+/// Subagent frames are stateful and get first refusal. Announcement pushes are
+/// stateless and occupy disjoint method names, so composing them here keeps the
+/// shared ACP loop provider-neutral and prevents two hooks from competing for
+/// the same frame.
+struct GrokObserver {
+    subagents: super::subagent::SubagentTracker,
+    announcements: HashMap<String, AgentEvent>,
+    announcement_order: VecDeque<String>,
+}
+
+/// A persistent Grok session can receive vendor pushes between every turn.
+/// Keep exact-repeat suppression useful without letting distinct ids turn the
+/// observer into an allocator.
+const MAX_TRACKED_ANNOUNCEMENTS: usize = 64;
+
+impl GrokObserver {
+    fn new(session_id: String) -> Self {
+        Self {
+            subagents: super::subagent::SubagentTracker::new(session_id),
+            announcements: HashMap::new(),
+            announcement_order: VecDeque::new(),
+        }
+    }
+
+    fn new_announcements(&mut self, method: &str, params: &Value) -> Vec<AgentEvent> {
+        let mut fresh = Vec::new();
+        for event in announcement_notices(method, params) {
+            let key = match &event {
+                AgentEvent::Notice { key, .. } => key.as_ref(),
+                _ => None,
+            };
+            let Some(key) = key else {
+                fresh.push(event);
+                continue;
+            };
+            if self.announcements.get(key) == Some(&event) {
+                continue;
+            }
+            if !self.announcements.contains_key(key) {
+                if self.announcement_order.len() >= MAX_TRACKED_ANNOUNCEMENTS
+                    && let Some(evicted) = self.announcement_order.pop_front()
+                {
+                    self.announcements.remove(&evicted);
+                }
+                self.announcement_order.push_back(key.clone());
+            }
+            self.announcements.insert(key.clone(), event.clone());
+            fresh.push(event);
+        }
+        fresh
+    }
+}
+
+impl NotificationObserver for GrokObserver {
+    fn observe(&mut self, method: &str, params: &Value) -> NotificationObservation {
+        let observed = self.subagents.observe(method, params);
+        if observed.claimed {
+            return observed;
+        }
+
+        NotificationObservation {
+            events: self.new_announcements(method, params),
+            claimed: matches!(method, ANNOUNCEMENT_UPDATE_METHOD | SETTINGS_UPDATE_METHOD),
+        }
+    }
 }
 
 /// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
@@ -811,10 +883,10 @@ impl Harness for GrokHarness {
             &request,
             config_requests,
             map_open_failure,
-            Some(announcement_notices),
+            None,
         )
         .await?;
-        let observer = super::subagent::SubagentTracker::new(session.session_id().to_owned());
+        let observer = GrokObserver::new(session.session_id().to_owned());
         Ok(super::session::run_observed(
             session,
             HarnessId::Grok,
@@ -918,6 +990,43 @@ mod tests {
             })
         ));
         assert!(announcement_notices("_x.ai/models/update", &json!({})).is_empty());
+    }
+
+    /// Break caught: exact-repeat suppression needs run-scoped memory, but a
+    /// provider can mint unbounded announcement ids over a persistent session.
+    /// Once the 64-entry budget is exceeded, the oldest reading is forgotten
+    /// and may surface again rather than letting the observer become an
+    /// allocator.
+    #[test]
+    fn announcement_repeat_memory_evicts_the_oldest_reading() {
+        let mut observer = GrokObserver::new("session-1".into());
+        for index in 0..65 {
+            let observed = observer.observe(
+                ANNOUNCEMENT_UPDATE_METHOD,
+                &json!({
+                    "announcements": [{
+                        "id": format!("notice-{index}"),
+                        "title": "Same visible payload"
+                    }]
+                }),
+            );
+            assert_eq!(observed.events.len(), 1);
+        }
+
+        let oldest_again = observer.observe(
+            ANNOUNCEMENT_UPDATE_METHOD,
+            &json!({
+                "announcements": [{
+                    "id": "notice-0",
+                    "title": "Same visible payload"
+                }]
+            }),
+        );
+        assert_eq!(
+            oldest_again.events.len(),
+            1,
+            "the oldest exact reading must be evicted once the bounded cache fills"
+        );
     }
 
     /// Break caught: reordering Grok's launch tokens. `--no-auto-update` is

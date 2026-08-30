@@ -31,6 +31,7 @@
 //! | `request-permission-unrecognized` | identical, but the options carry no kind this build recognizes (`vendor_custom` only) — poses the protocol-drift case, which a correct client answers `cancelled` on its own, never touching the approval bridge |
 //! | `request-permission-edit` | identical, but `toolCall.kind` is `"edit"` with a `diff` content block and the options are Hermes' real two-option edit shape (`allow_once`/`reject_once`, no `allow_always` at all) — poses the shape `AllowForSession`'s narrow-to-`allow_once` fallback exists for |
 //! | `grok-subagent-late` | sends Grok's `spawn_subagent` tool frames plus spawned/progress lifecycle notifications, settles the parent turn, then sends `subagent_finished` after a delay on `_x.ai/session_notification` |
+//! | `grok-subagent-late-with-announcements` | the same late subagent lifecycle, plus one announcement during the turn and an exact repeat, changed same-id update, and distinct-id update after `Done` |
 //! | anything else   | one text chunk, then `stopReason: "end_turn"`, no completion notification |
 //!
 //! **`starve` and `ignore-cancel` are not the same mode**, and the difference
@@ -579,6 +580,7 @@ fn handle_prompt(
     }
 
     if text.contains("grok-subagent-late") {
+        let with_announcements = text.contains("with-announcements");
         // Grok 1.0.4's real shape: the spawn is an ordinary ACP tool call,
         // while lifecycle updates use the vendor notification method with the
         // same `{sessionId, update}` envelope as `session/update`.
@@ -609,6 +611,20 @@ fn handle_prompt(
                 "params": {"sessionId": session_id, "update": payload},
             }));
         };
+        let announcement = |id: &str, message: &str| {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": "_x.ai/announcements/update",
+                "params": {"announcements": [{
+                    "id": id,
+                    "title": message,
+                    "severity": "warning"
+                }]}
+            }));
+        };
+        if with_announcements {
+            announcement("boundary-repeat", "Boundary announcement");
+        }
         lifecycle(json!({
             "sessionUpdate": "subagent_spawned",
             "subagent_id": "sub-1",
@@ -636,6 +652,11 @@ fn handle_prompt(
             "turns": 1,
             "output": "two files"
         }));
+        if with_announcements {
+            announcement("boundary-repeat", "Boundary announcement");
+            announcement("boundary-repeat", "Boundary announcement updated");
+            announcement("boundary-distinct", "Another announcement");
+        }
         return None;
     }
 

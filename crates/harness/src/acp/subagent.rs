@@ -87,16 +87,22 @@ impl SubagentTracker {
                 return NotificationObservation::default();
             }
             let raw = &update["rawInput"];
+            let description = raw["description"].as_str().unwrap_or_default();
+            tracing::debug!(
+                target: "comet_harness::acp::grok",
+                "subagent description (full text): {description}"
+            );
+            let prompt = raw["prompt"].as_str().filter(|prompt| !prompt.is_empty());
+            if let Some(prompt) = prompt {
+                tracing::debug!(
+                    target: "comet_harness::acp::grok",
+                    "subagent prompt (full text): {prompt}"
+                );
+            }
             self.pending.push_back(PendingSpawn {
                 tool_call_id: id.to_owned(),
-                description: crate::cap_prose(
-                    raw["description"].as_str().unwrap_or_default(),
-                    crate::SUBAGENT_DESCRIPTION_MAX,
-                ),
-                prompt: raw["prompt"]
-                    .as_str()
-                    .filter(|p| !p.is_empty())
-                    .map(|p| crate::cap_prose(p, crate::SUBAGENT_PROMPT_MAX)),
+                description: crate::cap_prose(description, crate::SUBAGENT_DESCRIPTION_MAX),
+                prompt: prompt.map(|p| crate::cap_prose(p, crate::SUBAGENT_PROMPT_MAX)),
                 agent_type: raw["subagent_type"].as_str().unwrap_or_default().to_owned(),
             });
             // Existing transcript projection suppresses one bare `Agent` chip
@@ -204,11 +210,15 @@ impl SubagentTracker {
             );
             return Vec::new();
         };
+        let description = update["description"].as_str().unwrap_or_default();
+        if !description.is_empty() {
+            tracing::debug!(
+                target: "comet_harness::acp::grok",
+                "subagent lifecycle description (full text): {description}"
+            );
+        }
         let spawned = Spawned {
-            description: crate::cap_prose(
-                update["description"].as_str().unwrap_or_default(),
-                crate::SUBAGENT_DESCRIPTION_MAX,
-            ),
+            description: crate::cap_prose(description, crate::SUBAGENT_DESCRIPTION_MAX),
             agent_type: update["subagent_type"]
                 .as_str()
                 .unwrap_or_default()
@@ -216,7 +226,11 @@ impl SubagentTracker {
         };
 
         if !self.bound.contains_key(subagent_id) {
-            let description = update["description"].as_str().unwrap_or_default();
+            // Compare the same bounded representation stored on the pending
+            // side. Comparing its capped text to the provider's raw lifecycle
+            // string makes every over-limit description miss and fall through
+            // to FIFO, which can swap concurrent out-of-order spawns.
+            let description = spawned.description.as_str();
             let ix = self
                 .pending
                 .iter()
@@ -493,6 +507,68 @@ mod tests {
             by_fifo.events.as_slice(),
             [AgentEvent::SubagentStarted { task_id, tool_use_id, .. }]
                 if task_id == "sub-1" && tool_use_id == "sp1"
+        ));
+    }
+
+    /// Break caught: the pending side capped descriptions before storing them,
+    /// while the lifecycle side compared the provider's full string. Any
+    /// over-limit description therefore missed its exact match and silently
+    /// fell back to FIFO, swapping concurrently spawned cards when lifecycle
+    /// notifications arrived out of order.
+    #[test]
+    fn long_descriptions_still_correlate_out_of_order_before_fifo() {
+        let mut tracker = SubagentTracker::new("parent-1".into());
+        let first_description = format!("First {}", "a".repeat(crate::SUBAGENT_DESCRIPTION_MAX));
+        let second_description = format!("Second {}", "b".repeat(crate::SUBAGENT_DESCRIPTION_MAX));
+        for (id, description, prompt) in [
+            ("sp1", first_description.as_str(), "prompt one"),
+            ("sp2", second_description.as_str(), "prompt two"),
+        ] {
+            tracker.observe(
+                "session/update",
+                &envelope(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "rawInput": {"description": description, "prompt": prompt},
+                    "_meta": {"x.ai/tool": {"name": "spawn_subagent"}}
+                })),
+            );
+        }
+
+        let second = tracker.observe(
+            LIFECYCLE_METHOD,
+            &envelope(json!({
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": "sub-2",
+                "description": second_description
+            })),
+        );
+        assert!(matches!(
+            second.events.as_slice(),
+            [AgentEvent::SubagentStarted {
+                task_id,
+                tool_use_id,
+                prompt: Some(prompt),
+                ..
+            }] if task_id == "sub-2" && tool_use_id == "sp2" && prompt == "prompt two"
+        ));
+
+        let first = tracker.observe(
+            LIFECYCLE_METHOD,
+            &envelope(json!({
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": "sub-1",
+                "description": first_description
+            })),
+        );
+        assert!(matches!(
+            first.events.as_slice(),
+            [AgentEvent::SubagentStarted {
+                task_id,
+                tool_use_id,
+                prompt: Some(prompt),
+                ..
+            }] if task_id == "sub-1" && tool_use_id == "sp1" && prompt == "prompt one"
         ));
     }
 

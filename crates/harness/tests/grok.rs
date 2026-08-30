@@ -489,3 +489,83 @@ async fn a_grok_subagent_lifecycle_reaches_the_native_card_events() {
         "a correlated delegation must not also draw as a plain tool chip: {events:#?}"
     );
 }
+
+/// Break caught: D105 moved D109's stateless callback into the stateful Grok
+/// observer so notifications could still flow while the parent was parked.
+/// Without a run-scoped exact-repeat guard, the same announcement id + payload
+/// is emitted again after `Done`, where the transcript can no longer collapse
+/// it into the earlier entry.
+#[tokio::test]
+async fn announcements_and_subagents_share_both_sides_of_done_without_exact_repeats() {
+    let cwd = std::env::temp_dir().join("comet-grok-subagent-announcement-boundary");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = against_fixture();
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "grok-subagent-late-with-announcements".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let saw_last_notice = matches!(
+                &event,
+                AgentEvent::Notice {
+                    key: Some(key),
+                    ..
+                } if key == "grok-announcement:boundary-distinct"
+            );
+            events.push(event);
+            if saw_last_notice {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("late lifecycle and announcements arrive while the parent is parked");
+    drop(steer_tx);
+
+    let done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("the parent turn settles");
+    let repeated: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            AgentEvent::Notice {
+                summary,
+                key: Some(key),
+                ..
+            } if key == "grok-announcement:boundary-repeat" => Some((index, summary.as_str())),
+            _ => None,
+        })
+        .collect();
+    let repeated_summaries: Vec<_> = repeated.iter().map(|(_, summary)| *summary).collect();
+    assert_eq!(
+        repeated_summaries,
+        ["Boundary announcement", "Boundary announcement updated"],
+        "one active-turn notice and one changed post-Done update must survive, but the exact post-Done repeat must not: {events:#?}"
+    );
+    assert!(repeated[0].0 < done && repeated[1].0 > done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SubagentUpdated {
+            status: SubagentStatus::Completed,
+            ..
+        }
+    )));
+}
