@@ -1942,6 +1942,17 @@ async fn drive_run(
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
     let mut entry_id = new_id();
+    // `task_id` → the entry that currently holds its `Subagent` card. Lives
+    // for exactly the RUN's lifetime (this local, dropped when `drive_run`
+    // returns) — the run's process is the only thing that can still hear
+    // from the child, so once it ends nothing more will ever arrive to
+    // route. Updated every time `SubagentStarted` folds a card into the
+    // CURRENT `entry_id`; read when a `SubagentUpdated` names a `task_id`
+    // the live `folded` accumulator no longer holds — i.e. its segment
+    // already finished and rotated to a new entry (D98: Claude's `Agent`
+    // tool is not synchronous with the parent's turn, so a `Done` can finish
+    // and park the segment before the child reports its real outcome).
+    let mut subagent_locations: HashMap<String, String> = HashMap::new();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
     let mut dirty = false;
@@ -2200,9 +2211,27 @@ async fn drive_run(
         // only write an empty segment. It just must not count as turn-start.
         let parked_title =
             idle_since.is_some() && matches!(&event, AgentEvent::SessionTitled { .. });
+        // D98's own case, and the SAME "can arrive outside a turn" class as
+        // `Notice`/`SessionTitled`: the whole reason a late `SubagentUpdated`
+        // needs routing back into a finished entry is that it arrives AFTER
+        // the turn that started it already parked. Counting it as turn-start
+        // would retrigger exactly the wedge the comment above describes —
+        // `idle_since` cleared, the idle reaper disarmed, status flipped to
+        // Working for a background child's own report, nothing left to ever
+        // park it again. `SubagentStarted` never legitimately opens a fresh
+        // turn either, so it gets the same exemption for symmetry, though no
+        // capture has shown it arriving while parked. Neither variant folds
+        // to a visible part while `folded` is empty (the just-parked state),
+        // so — like `parked_title`, unlike `parked_notice` — this needs no
+        // "write it as its own finished entry" handling below.
+        let parked_subagent = idle_since.is_some()
+            && matches!(
+                &event,
+                AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentUpdated { .. }
+            );
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
-        if !parked_notice && !parked_title && idle_since.take().is_some() {
+        if !parked_notice && !parked_title && !parked_subagent && idle_since.take().is_some() {
             inner.set_status(&chat_id, SessionStatus::Working, true);
         }
 
@@ -2391,6 +2420,68 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
+        }
+
+        // D98: keep `subagent_locations` current, and route a `SubagentUpdated`
+        // the live fold above just dropped back to the entry that actually
+        // holds its card. `SubagentStarted` always records/refreshes the
+        // CURRENT `entry_id` — matching exactly where the fold just placed
+        // (or refreshed) the part, including a `SendMessage` resume that
+        // starts a fresh card under a new `entry_id`. A `SubagentUpdated` is
+        // only a routing candidate when `folded` — the live accumulator this
+        // segment hasn't flushed and cleared yet — no longer has a matching
+        // part: while the segment is still open, the ordinary fold above
+        // already applied it in place, and it will reach the doc through the
+        // normal commit/finish path like everything else in `folded`.
+        match &event {
+            AgentEvent::SubagentStarted { task_id, .. } => {
+                subagent_locations.insert(task_id.clone(), entry_id.clone());
+            }
+            AgentEvent::SubagentUpdated {
+                task_id,
+                status,
+                activity,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+            } => {
+                let live = folded.iter().any(
+                    |p| matches!(p, MessagePart::Subagent { task_id: tid, .. } if tid == task_id),
+                );
+                if !live && let Some(target_entry) = subagent_locations.get(task_id) {
+                    match doc_ref.apply_late_subagent_update(
+                        target_entry,
+                        task_id,
+                        *status,
+                        activity.as_deref(),
+                        summary.as_deref(),
+                        *total_tokens,
+                        *duration_ms,
+                        *tool_uses,
+                    ) {
+                        Ok(true) => tracing::debug!(
+                            chat = %chat_id,
+                            task_id = %task_id,
+                            entry = %target_entry,
+                            "routed a late SubagentUpdated to its already-finished entry"
+                        ),
+                        Ok(false) => tracing::warn!(
+                            chat = %chat_id,
+                            task_id = %task_id,
+                            entry = %target_entry,
+                            "late SubagentUpdated named an entry with no matching subagent part"
+                        ),
+                        Err(err) => tracing::warn!(
+                            chat = %chat_id,
+                            task_id = %task_id,
+                            error = %err,
+                            "late SubagentUpdated write failed"
+                        ),
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Between-turns notice: write it NOW as a complete entry and stay

@@ -2962,6 +2962,207 @@ async fn a_cleanly_completed_turn_does_not_cancel_a_still_running_subagent() {
     );
 }
 
+/// D98's FULL shape: everything `BackgroundSubagentOutlivesTurnHarness` does,
+/// plus the child's real outcome arriving afterward — on the SAME
+/// persistent-session stream, after the run has already parked past `Done`
+/// and rotated to a new, still-empty entry. Journal seq numbers from the
+/// 2026-08-26 capture, in comments.
+struct LateSubagentCompletionHarness;
+
+#[async_trait]
+impl Harness for LateSubagentCompletionHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "LateSubagentCompletion"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![ReasoningLevel::Medium],
+            runtime_modes: Vec::new(),
+            ..HarnessCapabilities::default()
+        }
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            // seq 46
+            let _ = tx.send(AgentEvent::SubagentStarted {
+                task_id: "t1".into(),
+                tool_use_id: "tu1".into(),
+                agent_type: "general-purpose".into(),
+                description: "List current directory and count entries".into(),
+                prompt: None,
+            });
+            // seq 48
+            let _ = tx.send(AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Running,
+                activity: None,
+                summary: None,
+                total_tokens: None,
+                duration_ms: None,
+                tool_uses: None,
+            });
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: "delegated".into(),
+            });
+            // seq 57 — the turn ends CLEANLY with the child still live. A
+            // steerable harness PARKS here: the segment above is finished and
+            // the accumulator clears/rotates to a new entry id before the
+            // events below arrive on this same stream.
+            let _ = tx.send(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: Some("Agent is running. Waiting for completion notification.".into()),
+                error: None,
+                session_id: None,
+            });
+            // seq 58 — still running, first usage reading.
+            let _ = tx.send(AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Running,
+                activity: None,
+                summary: None,
+                total_tokens: Some(500),
+                duration_ms: None,
+                tool_uses: None,
+            });
+            // seq 61 — completed, answer not attached yet.
+            let _ = tx.send(AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: None,
+                total_tokens: Some(1234),
+                duration_ms: Some(5000),
+                tool_uses: Some(3),
+            });
+            // seq 62 — the child's answer lands.
+            let _ = tx.send(AgentEvent::SubagentUpdated {
+                task_id: "t1".into(),
+                status: SubagentStatus::Completed,
+                activity: None,
+                summary: Some("Found 12 entries in the current directory.".into()),
+                total_tokens: Some(1234),
+                duration_ms: Some(5000),
+                tool_uses: Some(3),
+            });
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_subagent_completion_reaches_the_finished_segment_it_belongs_to() {
+    // D98: by the time the child reports its real outcome, the segment that
+    // holds its card is already FINISHED and the run has parked into a new,
+    // empty entry. The late reading must route back into the entry that
+    // actually holds the card — not vanish, and not land in the new one.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(LateSubagentCompletionHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-late-subagent",
+        SessionCommandPayload::Run {
+            request: run_request("delegate this"),
+            message_id: "m-user".into(),
+        },
+    );
+
+    wait_for(
+        || entries_text_now(&core).contains("delegated"),
+        "the turn to complete",
+    )
+    .await;
+
+    let entry_with_card = entries_now(&core)
+        .into_iter()
+        .find(|e| {
+            e.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Subagent { .. }))
+        })
+        .expect("subagent card landed somewhere")
+        .id;
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Subagent {
+                            status: SubagentStatus::Completed,
+                            summary: Some(_),
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "the late completion to reach the card",
+    )
+    .await;
+
+    let entries = entries_now(&core);
+    let card = entries
+        .iter()
+        .find(|e| e.id == entry_with_card)
+        .expect("the ORIGINAL entry still holds the card")
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            MessagePart::Subagent {
+                status,
+                summary,
+                total_tokens,
+                duration_ms,
+                tool_uses,
+                ..
+            } => Some((
+                *status,
+                summary.clone(),
+                *total_tokens,
+                *duration_ms,
+                *tool_uses,
+            )),
+            _ => None,
+        })
+        .expect("the original entry's subagent part");
+
+    assert_eq!(card.0, SubagentStatus::Completed);
+    assert_eq!(
+        card.1.as_deref(),
+        Some("Found 12 entries in the current directory.")
+    );
+    assert_eq!(card.2, Some(1234));
+    assert_eq!(card.3, Some(5000));
+    assert_eq!(card.4, Some(3));
+
+    // No stray entry: the park rotated to a fresh entry id, but nothing was
+    // ever folded into it, so it must never have been written.
+    assert_eq!(
+        entries.len(),
+        2,
+        "the late update must not create a new entry: {entries:?}"
+    );
+}
+
 /// The same shape, but the turn is CUT SHORT. This is the case the sweep
 /// exists for, and the half that narrowing it must not disable.
 struct ErroredTurnWithRunningSubagentHarness;
