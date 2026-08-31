@@ -306,6 +306,8 @@ const STARTUP_TIMEOUT_MESSAGE: &str =
     "Codex didn't finish starting. Open Codex in a terminal to sign in, then try again.";
 const STARTUP_FAILURE_MESSAGE: &str =
     "Codex couldn't start. Check that Codex is signed in, then try again.";
+const TURN_START_TIMEOUT_MESSAGE: &str = "Codex stopped responding. Try again.";
+const TURN_START_FAILURE_MESSAGE: &str = "Codex couldn't start a turn. Try again.";
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
@@ -315,7 +317,7 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Bound on initialize plus thread resume/start. It never covers a turn.
+    /// Bound on initialize, thread setup, and each `turn/start` reply.
     startup_timeout: Duration,
     /// One `model/list` per boot. `models()` is also called by titling
     /// (`crates/engine/src/titles.rs:159`) on every title generation, so an
@@ -432,7 +434,8 @@ impl CodexHarness {
         self
     }
 
-    /// Tune the initialize and thread setup bound. Running turns are unbounded.
+    /// Tune the initialize, thread setup, and turn-start reply bound. Running
+    /// turns are unbounded once Codex acknowledges their start.
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
@@ -680,10 +683,75 @@ async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEven
     tx.send(Ok(ev)).await.is_ok()
 }
 
-/// `turn/start` and return the new turn id from the response.
-async fn start_turn(client: &RpcClient, params: Value) -> Result<String, HarnessError> {
-    let started = client.request("turn/start", params).await?;
-    Ok(started["turn"]["id"].as_str().unwrap_or("").to_owned())
+enum TurnStart {
+    Started(String),
+    TimedOut,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct TurnStartContext<'a> {
+    timeout: Duration,
+    interrupt: &'a crate::CancellationToken,
+    thread_id: &'a str,
+}
+
+/// Bound and interrupt every `turn/start`, including a steer fallback.
+async fn start_turn(client: &RpcClient, params: Value, context: TurnStartContext<'_>) -> TurnStart {
+    tokio::select! {
+        result = tokio::time::timeout(context.timeout, client.request("turn/start", params)) => match result {
+            Ok(Ok(started)) => TurnStart::Started(
+                started["turn"]["id"].as_str().unwrap_or("").to_owned(),
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "comet_harness::codex",
+                    %error,
+                    "codex turn/start failed"
+                );
+                TurnStart::Failed
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "comet_harness::codex",
+                    timeout_secs = context.timeout.as_secs_f64(),
+                    "codex turn/start timed out"
+                );
+                TurnStart::TimedOut
+            }
+        },
+        _ = context.interrupt.cancelled() => TurnStart::Interrupted,
+    }
+}
+
+async fn send_turn_start_terminal(
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    outcome: TurnStart,
+    context: TurnStartContext<'_>,
+) -> bool {
+    let event = match outcome {
+        TurnStart::TimedOut => AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(TURN_START_TIMEOUT_MESSAGE.into()),
+            session_id: Some(context.thread_id.into()),
+        },
+        TurnStart::Interrupted => AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some(context.thread_id.into()),
+        },
+        TurnStart::Failed => AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(TURN_START_FAILURE_MESSAGE.into()),
+            session_id: Some(context.thread_id.into()),
+        },
+        TurnStart::Started(_) => unreachable!("a started turn has no terminal result"),
+    };
+    send(event_tx, event).await
 }
 
 /// The per-run event loop: one task multiplexing app-server messages, the
@@ -860,23 +928,22 @@ async fn run_session(session: Session) {
         return;
     }
 
+    let turn_start_context = TurnStartContext {
+        timeout: startup_timeout,
+        interrupt: &interrupt,
+        thread_id: &thread_id,
+    };
     let mut router = TurnRouter::default();
     match start_turn(
         &client,
         turn_start_params(&request, &thread_id, &request.prompt),
+        turn_start_context,
     )
     .await
     {
-        Ok(id) => router.adopt_started(id),
-        Err(e) => {
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(e.to_string()),
-                    session_id: Some(thread_id.clone()),
-                }))
-                .await;
+        TurnStart::Started(id) => router.adopt_started(id),
+        outcome => {
+            let _ = send_turn_start_terminal(&event_tx, outcome, turn_start_context).await;
             shutdown_child(&mut child, kill_grace).await;
             tree.terminate();
             return;
@@ -1050,6 +1117,7 @@ async fn run_session(session: Session) {
                             if !steer_as_new_turn(
                                 &client,
                                 turn_start_params(&request, &thread_id, &text),
+                                turn_start_context,
                                 &mut router,
                                 &event_tx,
                                 &mut assistant_message_id,
@@ -1236,6 +1304,7 @@ async fn run_session(session: Session) {
                                 } else if !steer_as_new_turn(
                                     &client,
                                     turn_start_params(&request, &thread_id, &text),
+                                    turn_start_context,
                                     &mut router,
                                     &event_tx,
                                     &mut assistant_message_id,
@@ -1250,6 +1319,7 @@ async fn run_session(session: Session) {
                     } else if !steer_as_new_turn(
                         &client,
                         turn_start_params(&request, &thread_id, &text),
+                        turn_start_context,
                         &mut router,
                         &event_tx,
                         &mut assistant_message_id,
@@ -1359,13 +1429,14 @@ async fn run_session(session: Session) {
 async fn steer_as_new_turn(
     client: &RpcClient,
     params: Value,
+    context: TurnStartContext<'_>,
     router: &mut TurnRouter,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     assistant_message_id: &mut String,
     done_current: &mut bool,
 ) -> bool {
-    match start_turn(client, params).await {
-        Ok(id) => {
+    match start_turn(client, params, context).await {
+        TurnStart::Started(id) => {
             router.adopt_started(id);
             *done_current = false;
             let (prev, next) = rotate(assistant_message_id);
@@ -1378,14 +1449,9 @@ async fn steer_as_new_turn(
             )
             .await
         }
-        Err(e) => {
-            let _ = send(
-                event_tx,
-                AgentEvent::Error {
-                    message: format!("Steering failed: {e}"),
-                },
-            )
-            .await;
+        outcome => {
+            *done_current = true;
+            let _ = send_turn_start_terminal(event_tx, outcome, context).await;
             false
         }
     }
