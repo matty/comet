@@ -6,10 +6,11 @@
 //! 1. **Union, never replacement.** The provider decides what is NEW; it does
 //!    not get to delete a curated model. A flaky or partial answer would
 //!    otherwise silently remove a model the user is mid-session with.
-//! 2. **Curated capability wins on a matched id.** Both providers under-report
-//!    what a model can do — Claude's `supportedEffortLevels` tops out at `max`
-//!    and never mentions `ultracode`/`ultrathink`/`ultra`, and neither provider
-//!    reports Comet's option sets (context window, fast mode) at all.
+//! 2. **Curated capability wins on a matched id, except where the provider
+//!    explicitly closes a gate.** Both providers under-report what a model can
+//!    do, so absent metadata cannot erase a curated capability. Codex does
+//!    report per-model service-tier availability, however, and an explicitly
+//!    empty list removes that one curated option (D37).
 
 use comet_proto::{AgentCommand, Model, ModelCatalog, ModelDeprecation, ReasoningLevel};
 
@@ -30,6 +31,11 @@ pub struct DiscoveredModel {
     /// The provider's own default within `reasoning_levels`, if it reported
     /// one. `None` is unknown, never an inferred level.
     pub default_reasoning: Option<ReasoningLevel>,
+    /// Whether the provider listed any service tier for this model.
+    ///
+    /// `None` means the provider did not report the field. Only an explicit
+    /// `Some(false)` may remove the curated `serviceTier` option.
+    pub service_tier_available: Option<bool>,
     /// `None` = the provider did not say. NOT "no images" — see
     /// `.agents/rules/optional-wire-fields.md`.
     pub accepts_images: Option<bool>,
@@ -111,6 +117,9 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
                 }
                 model.deprecation = live.deprecation.clone();
                 model.default_reasoning = live.default_reasoning;
+                if live.service_tier_available == Some(false) {
+                    model.options.retain(|option| option.id != "serviceTier");
+                }
             }
             model
         })
@@ -340,6 +349,7 @@ mod tests {
             deprecation: None,
             reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::High],
             default_reasoning: None,
+            service_tier_available: None,
             accepts_images: None,
         }
     }
@@ -486,6 +496,58 @@ mod tests {
             &Discovery { models: vec![live] },
         );
         assert!(!merged[0].accepts_images);
+    }
+
+    #[test]
+    fn explicit_empty_live_service_tiers_remove_only_the_curated_tier_option() {
+        let mut model = curated("m-1", "Curated", &[]);
+        model.options.push(ModelOption {
+            id: "serviceTier".into(),
+            label: "Service Tier".into(),
+            choices: vec![ModelOptionChoice {
+                id: "fast".into(),
+                label: "Fast".into(),
+            }],
+            default_choice: "default".into(),
+        });
+        let mut live = discovered("m-1", "Live");
+        live.service_tier_available = Some(false);
+
+        let merged = merge(vec![model], &Discovery { models: vec![live] });
+        let option_ids: Vec<&str> = merged[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect();
+        assert_eq!(option_ids, vec!["contextWindow"]);
+    }
+
+    #[test]
+    fn unknown_or_failed_service_tier_discovery_keeps_the_curated_fallback() {
+        let mut model = curated("m-1", "Curated", &[]);
+        model.options.push(ModelOption {
+            id: "serviceTier".into(),
+            label: "Service Tier".into(),
+            choices: vec![],
+            default_choice: "default".into(),
+        });
+
+        let unknown = merge(
+            vec![model.clone()],
+            &Discovery {
+                models: vec![discovered("m-1", "Live")],
+            },
+        );
+        assert!(unknown[0].options.iter().any(|o| o.id == "serviceTier"));
+
+        let failed =
+            DiscoveryCache::default().catalog(vec![model], Err(DiscoveryFailure::Unreachable));
+        assert!(
+            failed.models[0]
+                .options
+                .iter()
+                .any(|o| o.id == "serviceTier")
+        );
     }
 
     use std::sync::Arc;
@@ -786,6 +848,7 @@ mod tests {
                     ReasoningLevel::Ultrathink,
                 ],
                 default_reasoning: None,
+                service_tier_available: None,
                 accepts_images: Some(true),
             }],
         };

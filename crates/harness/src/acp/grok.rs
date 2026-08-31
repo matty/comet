@@ -294,6 +294,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                 per_model
             },
             default_reasoning: None,
+            service_tier_available: None,
             accepts_images: image_support,
             id,
         }

@@ -198,6 +198,31 @@ pub fn resolve_reasoning(
     }
 }
 
+/// Keep stored option picks user-owned, but only send values the selected
+/// model currently advertises. With no catalog there is no capability boundary
+/// to clamp against, so the remembered values pass through unchanged.
+pub fn resolve_model_options(
+    selections: &serde_json::Map<String, serde_json::Value>,
+    model: Option<&Model>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let Some(model) = model else {
+        return selections.clone();
+    };
+    model
+        .options
+        .iter()
+        .filter_map(|option| {
+            let value = selections.get(&option.id)?;
+            let choice = value.as_str()?;
+            option
+                .choices
+                .iter()
+                .any(|available| available.id == choice)
+                .then(|| (option.id.clone(), value.clone()))
+        })
+        .collect()
+}
+
 /// Shown under the model list while discovery has failed. Amber
 /// `warning_muted`, not red: a state to resolve, not an error the user
 /// caused (0.2a's rail caption is the worked example). No Retry button of
@@ -318,12 +343,11 @@ pub(crate) fn decode_harnesses_reply(
 }
 
 /// Applies a picker's field change to a chat config that is about to be
-/// persisted: preserve the row's own runtime mode across the change (the
-/// caller's `config` may already carry the draft's default, not the row's),
-/// then re-derive `sandbox` from whatever mode `change` leaves behind. Doing
-/// the derivation last is what keeps the two fields from disagreeing — a
-/// closure that sets `runtime_mode` must not leave `sandbox` pointing at the
-/// mode that used to be there.
+/// persisted: preserve the row's own runtime mode and stored model-option
+/// choices across the change (the caller's effective run config may contain a
+/// draft mode and capability-filtered options), then re-derive `sandbox` from
+/// whatever mode `change` leaves behind. The closure still owns an intentional
+/// option pick because it runs after preservation.
 fn apply_owned_fields(
     config: &mut ChatConfig,
     existing: Option<&ChatConfig>,
@@ -331,6 +355,7 @@ fn apply_owned_fields(
 ) {
     if let Some(existing) = existing {
         config.runtime_mode = existing.runtime_mode;
+        config.model_options = existing.model_options.clone();
     }
     change(config);
     config.sandbox = config.runtime_mode.sandbox();
@@ -1026,7 +1051,10 @@ impl Pickers {
                 // Catalog not loaded (offline): still send the id we know.
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
-            model_options: self.explicit_options(cx),
+            model_options: resolve_model_options(
+                &self.explicit_options(cx),
+                self.selected_model(cx),
+            ),
             runtime_mode: self.effective_runtime_mode(cx),
         }
     }
@@ -4523,6 +4551,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_model_options_are_not_sent_but_the_stored_choice_is_preserved() {
+        let model = Model {
+            id: "mini".into(),
+            label: "Mini".into(),
+            description: None,
+            reasoning_levels: vec![],
+            deprecation: None,
+            default_reasoning: None,
+            options: vec![],
+            accepts_images: true,
+        };
+        let mut stored = serde_json::Map::new();
+        stored.insert(
+            "serviceTier".into(),
+            serde_json::Value::String("fast".into()),
+        );
+
+        let effective = resolve_model_options(&stored, Some(&model));
+
+        assert!(
+            effective.is_empty(),
+            "an unavailable tier must not reach Codex"
+        );
+        assert_eq!(
+            stored.get("serviceTier").and_then(|value| value.as_str()),
+            Some("fast"),
+            "filtering the run must not erase the user's remembered choice"
+        );
+    }
+
+    #[test]
+    fn available_model_options_keep_only_choices_the_model_offers() {
+        let model = Model {
+            id: "sol".into(),
+            label: "Sol".into(),
+            description: None,
+            reasoning_levels: vec![],
+            deprecation: None,
+            default_reasoning: None,
+            options: vec![ModelOption {
+                id: "serviceTier".into(),
+                label: "Service Tier".into(),
+                choices: vec![ModelOptionChoice {
+                    id: "fast".into(),
+                    label: "Fast".into(),
+                }],
+                default_choice: "default".into(),
+            }],
+            accepts_images: true,
+        };
+        let mut selections = serde_json::Map::new();
+        selections.insert(
+            "serviceTier".into(),
+            serde_json::Value::String("fast".into()),
+        );
+        selections.insert("future".into(), serde_json::Value::String("value".into()));
+
+        let effective = resolve_model_options(&selections, Some(&model));
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective["serviceTier"], "fast");
+
+        selections.insert(
+            "serviceTier".into(),
+            serde_json::Value::String("stale".into()),
+        );
+        assert!(resolve_model_options(&selections, Some(&model)).is_empty());
+        assert_eq!(
+            resolve_model_options(&selections, None),
+            selections,
+            "without a catalog there is no capability boundary to clamp against"
+        );
+    }
+
     /// Every mode a provider can declare needs both strings — a chip with no
     /// label is unpickable, and a mode with no caption ships the one surface
     /// that explains what it does with a blank line.
@@ -4647,6 +4749,38 @@ mod tests {
             config.sandbox,
             config.runtime_mode.sandbox(),
             "sandbox must never disagree with the mode it was derived from"
+        );
+    }
+
+    #[test]
+    fn apply_owned_fields_preserves_stored_options_when_another_field_changes() {
+        let mut stored_options = serde_json::Map::new();
+        stored_options.insert(
+            "serviceTier".into(),
+            serde_json::Value::String("fast".into()),
+        );
+        let existing = ChatConfig {
+            harness: HarnessId::Codex,
+            model: Some("gpt-5.4-mini".into()),
+            reasoning: Some(ReasoningLevel::Medium),
+            model_options: stored_options,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            runtime_mode: RuntimeMode::AutoAcceptEdits,
+        };
+        let mut effective = existing.clone();
+        effective.model_options.clear();
+
+        apply_owned_fields(&mut effective, Some(&existing), |config| {
+            config.reasoning = Some(ReasoningLevel::High);
+        });
+
+        assert_eq!(
+            effective
+                .model_options
+                .get("serviceTier")
+                .and_then(|value| value.as_str()),
+            Some("fast"),
+            "a safe run filter must not become a destructive persistence update"
         );
     }
 
