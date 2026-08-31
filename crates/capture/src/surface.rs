@@ -118,8 +118,8 @@ pub struct MapPath {
 /// Declared rather than inferred. A model-keyed map is indistinguishable from a
 /// struct by shape alone — every capture on this machine used one model, so its
 /// key set looks perfectly stable — and a wrong guess silently renames a field.
-/// An undeclared map shows up in the snapshot as a field with an obviously
-/// data-shaped name, which triage catches and adds here.
+/// A suspected undeclared map stops sanitization before staging, so a human
+/// declares it here before a capability sheet can observe a promoted capture.
 ///
 /// **`sanitize.rs` reads this same list**, so one declaration decides both
 /// questions a map key raises: this module stops recording an unnamed child
@@ -232,10 +232,8 @@ pub const MAP_PATHS: &[MapPath] = &[
     },
 ];
 
-/// Whether `key` looks like a field name a developer chose, rather than a
-/// runtime identifier a provider generated at that position — the signal
-/// D77's gate uses the same heuristic on any object whose keys
-/// don't look like identifiers."
+/// Whether `key` has the identifier shape D77's pre-publication gate treats
+/// as a likely field name rather than a runtime-generated data key.
 ///
 /// ASCII letters, digits and underscore only, and not starting with a digit
 /// — an ordinary programming identifier. Every kind of data key this row has
