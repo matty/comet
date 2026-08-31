@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use comet_doc::{
-    SessionCommandEntry, SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
-    TranscriptFrame,
+    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+    SessionCommandStatus, SessionMessageEntry, TranscriptFrame,
 };
-use comet_engine::{EngineCore, HarnessRegistry, JournaledEvent};
+use comet_engine::{EngineCore, HarnessRegistry, JournaledEvent, RunJournal};
 use comet_harness::CodexHarness;
-use comet_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode, SessionStatus};
+use comet_proto::{
+    AgentEvent, ApprovalDecision, DoneStatus, HarnessId, RunRequest, RuntimeMode, SessionStatus,
+};
 use comet_rpc::RpcClient;
 
 const SPACE: &str = "space-provider-boundary";
@@ -112,8 +114,6 @@ fn journal(fixture: &EngineFixture) -> Vec<JournaledEvent> {
         .0
 }
 
-// Tasks 2–4 consume this once their provider scenarios are added.
-#[allow(dead_code)]
 fn apply_message_frame(entries: &mut Vec<SessionMessageEntry>, frame: TranscriptFrame) {
     comet_doc::apply_transcript_frame(entries, frame).expect("apply transcript frame");
 }
@@ -261,5 +261,158 @@ async fn fake_codex_rejected_resume_falls_back_to_a_fresh_durable_session() {
             "th-fresh".into(),
             Some(fixture.cwd.to_string_lossy().into_owned()),
         ))
+    );
+}
+
+#[tokio::test]
+async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() {
+    let fixture = EngineFixture::new();
+    let mut messages = fixture
+        .client
+        .subscribe(
+            comet_rpc::methods::WATCH_DOC_MESSAGES,
+            serde_json::json!({"chatId": CHAT}),
+        )
+        .await
+        .expect("watch fixture messages through RPC");
+    let reset: TranscriptFrame = serde_json::from_value(
+        tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("message reset before timeout")
+            .expect("message stream reset"),
+    )
+    .expect("deserialize message reset");
+    assert!(matches!(reset, TranscriptFrame::Reset { .. }));
+    let mut materialized = Vec::new();
+    apply_message_frame(&mut materialized, reset);
+
+    let queued = fixture
+        .client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": CHAT,
+                "command": SessionCommandPayload::Run {
+                    request: codex_request(&fixture, "scenario:cancel-approval", RuntimeMode::ApprovalRequired),
+                    message_id: "m-cancel-approval".into(),
+                },
+            }),
+        )
+        .await
+        .expect("queue cancellation run through RPC");
+    let run_command_id = queued["commandId"]
+        .as_str()
+        .expect("queued run command id")
+        .to_owned();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let request_id = loop {
+        let frame: TranscriptFrame = serde_json::from_value(
+            tokio::time::timeout_at(deadline, messages.recv())
+                .await
+                .expect("unresolved approval before timeout")
+                .expect("message stream remains open"),
+        )
+        .expect("deserialize approval frame");
+        apply_message_frame(&mut materialized, frame);
+        if let Some(request_id) =
+            materialized
+                .iter()
+                .flat_map(|entry| &entry.parts)
+                .find_map(|part| match part {
+                    MessagePart::Approval {
+                        request_id,
+                        decision: None,
+                        ..
+                    } => Some(request_id.clone()),
+                    _ => None,
+                })
+        {
+            break request_id;
+        }
+    };
+
+    let queued = fixture
+        .client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": CHAT,
+                "command": SessionCommandPayload::RespondApproval {
+                    request_id: request_id.clone(),
+                    decision: ApprovalDecision::DenyAndInterrupt {
+                        message: "stop before touching that file".into(),
+                    },
+                },
+            }),
+        )
+        .await
+        .expect("queue cancellation approval through RPC");
+    let approval_command_id = queued["commandId"]
+        .as_str()
+        .expect("queued approval command id")
+        .to_owned();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame: TranscriptFrame = serde_json::from_value(
+            tokio::time::timeout_at(deadline, messages.recv())
+                .await
+                .expect("aborted approval before timeout")
+                .expect("message stream remains open"),
+        )
+        .expect("deserialize terminal frame");
+        apply_message_frame(&mut materialized, frame);
+        if materialized.iter().any(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(MessageStatus::Aborted)
+                && entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Approval {
+                            request_id: resolved_id,
+                            decision: Some(ApprovalDecision::DenyAndInterrupt { message }),
+                            ..
+                        } if resolved_id == &request_id && message == "stop before touching that file"
+                    )
+                })
+        }) {
+            break;
+        }
+    }
+
+    wait_for(
+        || {
+            let entries = commands(&fixture);
+            entries.iter().any(|entry| {
+                entry.id == run_command_id && entry.status == SessionCommandStatus::Applied
+            }) && entries.iter().any(|entry| {
+                entry.id == approval_command_id && entry.status == SessionCommandStatus::Applied
+            }) && fixture
+                .core
+                .sessions
+                .session_status(CHAT)
+                .map(|session| session.status)
+                == Some(SessionStatus::Idle)
+        },
+        "both cancellation commands applied and session idle",
+    )
+    .await;
+
+    let replay = journal(&fixture);
+    assert!(matches!(
+        replay.last().map(|entry| &entry.event),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+    assert!(
+        RunJournal::open(fixture._data_dir.path().join("local-store/journals"))
+            .expect("open fixture journal")
+            .stale_sessions()
+            .expect("scan fixture journal")
+            .is_empty(),
+        "interrupted approval must leave no stale session"
     );
 }
