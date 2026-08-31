@@ -737,12 +737,9 @@ fn record_identity_rebuilt(data_dir: &Path) {
 
 /// Move a zero-byte `device-id` aside so the create-if-absent publish can run.
 ///
-/// Deliberately a rename and not the file lock upstream reaches for here
-/// (`8f2e5b0`-era `flock` plus a Windows share-mode open): that is
-/// platform-specific code on the one platform this repository ships and never
-/// tests in CI. Rename converges without it — two processes racing to repair
-/// both end at the create-if-absent publish, where one wins and the other
-/// re-reads. See `docs/debt/` for the residual window this leaves.
+/// The only production caller reaches this after `EngineCore::assemble` holds
+/// `InstanceLock`, so two live engines cannot race recovery. The bounded
+/// recovery remains necessary after a crashed engine releases that lock.
 fn displace_empty_device_id(data_dir: &Path, path: &Path) -> Result<bool, EngineError> {
     let aside = data_dir.join(format!(".device-id.empty-{}", new_id()));
     match std::fs::rename(path, &aside) {
@@ -762,6 +759,36 @@ fn displace_empty_device_id(data_dir: &Path, path: &Path) -> Result<bool, Engine
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn a_second_assembly_cannot_rebuild_device_id_while_the_first_holds_the_instance_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        )
+        .expect("first engine assembles and retains InstanceLock");
+
+        let path = dir.path().join("device-id");
+        assert!(!first.device_id.trim().is_empty());
+        assert_eq!(identity_rebuilt_at(dir.path()), None);
+        std::fs::write(&path, "").expect("manufacture the legacy-corrupt file");
+
+        let Err(error) = EngineCore::assemble(
+            dir.path(),
+            Arc::new(HarnessRegistry::new()),
+            HarnessId::Mock,
+            None,
+        ) else {
+            panic!("second assembly must be rejected before device-id recovery");
+        };
+        assert!(matches!(error, EngineError::AlreadyRunning { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(identity_rebuilt_at(dir.path()), None);
+    }
 
     /// A zero-byte `device-id` is what a pre-`13cd956f` crash leaves behind.
     /// Erroring on it stranded the installation with no way out, so the whole
