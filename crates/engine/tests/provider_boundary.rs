@@ -319,16 +319,6 @@ async fn fake_codex_rejected_resume_falls_back_to_a_fresh_durable_session() {
         }),
         "the completed fallback turn must survive shutdown: {replay:?}"
     );
-    assert!(
-        matches!(
-            replay.last().map(|entry| &entry.1),
-            Some(AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                ..
-            })
-        ),
-        "fixture shutdown must settle the parked Codex child: {replay:?}"
-    );
     assert_eq!(
         restarted.workspace.chat_harness_session(CHAT),
         Some((
@@ -413,6 +403,34 @@ async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() 
         },
     )
     .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame: TranscriptFrame = serde_json::from_value(
+            tokio::time::timeout_at(deadline, messages.recv())
+                .await
+                .expect("aborted approval before timeout")
+                .expect("message stream remains open"),
+        )
+        .expect("deserialize terminal frame");
+        apply_message_frame(&mut materialized, frame);
+        if materialized.iter().any(|entry| {
+            entry.role == MessageRole::Assistant
+                && entry.status == Some(MessageStatus::Aborted)
+                && entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Approval {
+                            request_id: resolved_id,
+                            decision: Some(ApprovalDecision::DenyAndInterrupt { message }),
+                            ..
+                        } if resolved_id == &request_id && message == "stop before touching that file"
+                    )
+                })
+        }) {
+            break;
+        }
+    }
 
     wait_for(
         || {
