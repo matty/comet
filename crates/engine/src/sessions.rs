@@ -288,8 +288,16 @@ struct Inner {
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     doc_host: OnceLock<DocHost>,
-    /// chat_id → live run.
+    /// chat_id → current routable run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// Every provider task that can still publish under a chat id, including a
+    /// task whose routing handle was displaced by a bounded replacement.
+    run_owners: Mutex<HashMap<String, HashSet<String>>>,
+    /// Wakes token-owned delete finalizers when any ownership pin changes.
+    /// The carried value is never read; only the wakeup itself matters.
+    run_owners_changed: watch::Sender<()>,
+    /// Cancels ownership waits during engine teardown without certifying purge.
+    shutdown: CancellationToken,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -350,6 +358,7 @@ impl SessionsEngine {
         registry: Arc<HarnessRegistry>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
+        let (run_owners_changed, _) = watch::channel(());
         Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -357,6 +366,9 @@ impl SessionsEngine {
                 registry,
                 doc_host: OnceLock::new(),
                 runs: Mutex::new(HashMap::new()),
+                run_owners: Mutex::new(HashMap::new()),
+                run_owners_changed,
+                shutdown: CancellationToken::new(),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -816,7 +828,7 @@ impl SessionsEngine {
                 }
 
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                let displaced = lock(&self.inner.runs).insert(chat_id.to_string(), run_handle);
+                let displaced = self.inner.register_run(chat_id, run_handle);
                 Ok((displaced, run_doc))
             })?;
         let (displaced, run_doc) = registration?;
@@ -948,7 +960,34 @@ impl SessionsEngine {
     /// this under DocHost's lifecycle gate as a defensive fallback for a run
     /// whose warm-handle map entry was already retired.
     pub(crate) fn has_live_run(&self, chat_id: &str) -> bool {
-        lock(&self.inner.runs).contains_key(chat_id)
+        self.inner.has_run_owner(chat_id)
+    }
+
+    /// Wait for every run registered before a token-owned final purge to stop
+    /// writing under this id. The caller's purge lifecycle prevents a newer
+    /// generation from registering while this wait is active.
+    pub(crate) async fn wait_for_no_live_runs(&self, chat_id: &str) -> bool {
+        // Subscribe before the first check so the final release cannot land in
+        // a check-then-subscribe gap and leave this waiting forever.
+        let mut owners_changed = self.inner.run_owners_changed.subscribe();
+        loop {
+            if !self.has_live_run(chat_id) {
+                return true;
+            }
+            if self.inner.shutdown.is_cancelled() {
+                return false;
+            }
+            tokio::select! {
+                changed = owners_changed.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                () = self.inner.shutdown.cancelled() => {
+                    return false;
+                }
+            }
+        }
     }
 
     /// Retire every session-owned remnant of a deleted chat. Callers hold the
@@ -1324,6 +1363,7 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1344,6 +1384,47 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    /// Install the current routing handle and independently pin the provider
+    /// task in the lifecycle census. The caller holds DocHost's purge gate.
+    fn register_run(&self, chat_id: &str, run_handle: RunHandle) -> Option<RunHandle> {
+        let run_id = run_handle.run_id.clone();
+        let inserted = lock(&self.run_owners)
+            .entry(chat_id.to_string())
+            .or_default()
+            .insert(run_id);
+        if inserted {
+            let _ = self.run_owners_changed.send(());
+        }
+        lock(&self.runs).insert(chat_id.to_string(), run_handle)
+    }
+
+    fn has_run_owner(&self, chat_id: &str) -> bool {
+        lock(&self.run_owners)
+            .get(chat_id)
+            .is_some_and(|owners| !owners.is_empty())
+    }
+
+    fn release_run_owner(&self, chat_id: &str, run_id: &str) {
+        let removed = {
+            let mut owners = lock(&self.run_owners);
+            let removed = owners
+                .get_mut(chat_id)
+                .is_some_and(|owners| owners.remove(run_id));
+            if owners.get(chat_id).is_some_and(HashSet::is_empty) {
+                owners.remove(chat_id);
+            }
+            removed
+        };
+        if removed {
+            let _ = self.run_owners_changed.send(());
+        }
+    }
+
+    fn retire_run(&self, chat_id: &str, run_id: &str) {
+        self.remove_run(chat_id, run_id);
+        self.release_run_owner(chat_id, run_id);
+    }
+
     #[cfg(test)]
     async fn pause_terminal_handoff_if_requested(
         &self,
@@ -1369,7 +1450,7 @@ impl Inner {
     /// between removal and the terminal upsert.
     async fn finish_run(&self, chat_id: &str, run_id: &str, final_status: SessionStatus) {
         self.set_status(chat_id, final_status, false);
-        self.remove_run(chat_id, run_id);
+        self.retire_run(chat_id, run_id);
         #[cfg(test)]
         if let Some(settled) = self.pause_terminal_handoff_if_requested(chat_id).await {
             let _ = settled.send(());
@@ -1922,6 +2003,21 @@ struct RunResumeState {
     resume_injected: bool,
 }
 
+/// Retires the exact lifecycle owner when a detached run task leaves for any
+/// reason, including unwinding from a provider panic. `retire_run`'s run-id
+/// check prevents an old task's drop from removing a replacement route.
+struct RunOwnerRetirementGuard {
+    inner: Arc<Inner>,
+    chat_id: String,
+    run_id: String,
+}
+
+impl Drop for RunOwnerRetirementGuard {
+    fn drop(&mut self) {
+        self.inner.retire_run(&self.chat_id, &self.run_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -1935,6 +2031,14 @@ async fn drive_run(
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
 ) {
+    // This must be the first task-owned local: every later operation includes
+    // provider code and document/status writes that may unwind. Normal explicit
+    // retirement remains idempotent; this guard closes every exceptional path.
+    let _owner_retirement = RunOwnerRetirementGuard {
+        inner: inner.clone(),
+        chat_id: chat_id.clone(),
+        run_id: run_id.clone(),
+    };
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
@@ -2292,7 +2396,7 @@ async fn drive_run(
                 "harness rejected injected resume id; retrying as a fresh session"
             );
             inner.forget_harness_session(&chat_id);
-            inner.remove_run(&chat_id, &run_id);
+            inner.retire_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -2706,9 +2810,10 @@ mod tests {
             },
         );
         sessions.set_status("chat-1", SessionStatus::Working, true);
-        lock(&sessions.inner.runs).insert(
-            "chat-1".into(),
+        sessions.inner.register_run(
+            "chat-1",
             bare_handle(
+                "run-1",
                 Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
             ),
@@ -2733,7 +2838,7 @@ mod tests {
         assert!(lock(&sessions.inner.statuses).contains_key("chat-1"));
         assert!(lock(&sessions.inner.hubs).contains_key("chat-1"));
 
-        lock(&sessions.inner.runs).remove("chat-1");
+        sessions.inner.retire_run("chat-1", "run-1");
         sessions.cleanup_deleted_chat("chat-1").unwrap();
 
         assert!(
@@ -3395,8 +3500,8 @@ mod tests {
         let mut old = parked_run_handle("run-1");
         let mut new = parked_run_handle("run-2");
 
-        lock(&sessions.inner.runs).insert("chat-1".into(), old.handle);
-        let displaced = lock(&sessions.inner.runs).insert("chat-1".into(), new.handle);
+        sessions.inner.register_run("chat-1", old.handle);
+        let displaced = sessions.inner.register_run("chat-1", new.handle);
         drop(displaced);
 
         assert!(
@@ -3414,18 +3519,115 @@ mod tests {
 
         // The successor's open approval is NOT collateral: `remove_run` for the
         // old run id must leave the handle it declines to retire untouched.
-        sessions.inner.remove_run("chat-1", "run-1");
+        sessions.inner.retire_run("chat-1", "run-1");
         assert!(matches!(
             new.approval.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
         assert!(lock(&sessions.inner.runs).contains_key("chat-1"));
 
-        sessions.inner.remove_run("chat-1", "run-2");
+        sessions.inner.retire_run("chat-1", "run-2");
         assert!(matches!(
             new.approval.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
+        assert!(!sessions.has_live_run("chat-1"));
+    }
+
+    #[test]
+    fn a_settled_replacement_does_not_hide_its_displaced_predecessor_from_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let old = bare_handle(
+            "run-1",
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let new = bare_handle(
+            "run-2",
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        sessions.inner.register_run("chat-1", old);
+        drop(sessions.inner.register_run("chat-1", new));
+        sessions.inner.retire_run("chat-1", "run-2");
+
+        assert!(
+            !lock(&sessions.inner.runs).contains_key("chat-1"),
+            "the settled successor no longer owns the routing slot"
+        );
+        assert!(
+            sessions.has_live_run("chat-1"),
+            "the displaced predecessor remains in the ownership census"
+        );
+        assert!(matches!(
+            sessions.cleanup_deleted_chat("chat-1"),
+            Err(SessionCleanupError::LiveRun)
+        ));
+
+        sessions.inner.retire_run("chat-1", "run-1");
+        assert!(!sessions.has_live_run("chat-1"));
+    }
+
+    #[tokio::test]
+    async fn final_owner_release_wakes_a_waiter_registered_before_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        sessions.inner.register_run(
+            "chat-1",
+            bare_handle(
+                "run-1",
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            ),
+        );
+        let waiter = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.wait_for_no_live_runs("chat-1").await }
+        });
+        tokio::task::yield_now().await;
+
+        sessions.inner.retire_run("chat-1", "run-1");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("final owner release wakes the waiter")
+                .expect("waiter task joins")
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_shutdown_cancels_an_owner_wait_without_certifying_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        sessions.inner.register_run(
+            "chat-1",
+            bare_handle(
+                "run-1",
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+            ),
+        );
+        sessions.inner.remove_run("chat-1", "run-1");
+        let waiter = tokio::spawn({
+            let sessions = sessions.clone();
+            async move { sessions.wait_for_no_live_runs("chat-1").await }
+        });
+        tokio::task::yield_now().await;
+
+        sessions.shutdown().await;
+
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("shutdown wakes the owner waiter")
+                .expect("waiter task joins"),
+            "shutdown cancellation is not evidence that cleanup is safe"
+        );
+        assert!(sessions.has_live_run("chat-1"));
+        sessions.inner.retire_run("chat-1", "run-1");
     }
 
     /// A reading is only worth keeping when the provider named the window it
@@ -3575,6 +3777,7 @@ mod tests {
     /// only ever reads the two pending maps, so this is cheaper than driving a
     /// harness through an approval or a question just to inspect timestamps.
     fn bare_handle(
+        run_id: &str,
         pending_approvals: PendingApprovals,
         pending_inputs: PendingInputs,
     ) -> RunHandle {
@@ -3582,7 +3785,7 @@ mod tests {
         let (cancel, _cancel_rx) = watch::channel(false);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
         RunHandle {
-            run_id: "r1".into(),
+            run_id: run_id.into(),
             steerable: false,
             supports_approval_interrupt: false,
             steer_tx,
@@ -3671,7 +3874,7 @@ mod tests {
 
         let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
-        let handle = bare_handle(pending_approvals.clone(), pending_inputs.clone());
+        let handle = bare_handle("r1", pending_approvals.clone(), pending_inputs.clone());
 
         assert_eq!(handle.blocked_since(), None, "nothing parked, not blocked");
 
