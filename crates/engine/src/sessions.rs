@@ -291,9 +291,10 @@ struct Inner {
     /// task whose routing handle was displaced by a bounded replacement.
     run_owners: Mutex<HashMap<String, HashSet<String>>>,
     /// Wakes token-owned delete finalizers when any ownership pin changes.
-    run_owners_changed: watch::Sender<u64>,
+    /// The carried value is never read; only the wakeup itself matters.
+    run_owners_changed: watch::Sender<()>,
     /// Cancels ownership waits during engine teardown without certifying purge.
-    shutting_down: watch::Sender<bool>,
+    shutdown: CancellationToken,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -354,8 +355,7 @@ impl SessionsEngine {
         registry: Arc<HarnessRegistry>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
-        let (run_owners_changed, _) = watch::channel(0);
-        let (shutting_down, _) = watch::channel(false);
+        let (run_owners_changed, _) = watch::channel(());
         Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -365,7 +365,7 @@ impl SessionsEngine {
                 runs: Mutex::new(HashMap::new()),
                 run_owners: Mutex::new(HashMap::new()),
                 run_owners_changed,
-                shutting_down,
+                shutdown: CancellationToken::new(),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -966,12 +966,11 @@ impl SessionsEngine {
         // Subscribe before the first check so the final release cannot land in
         // a check-then-subscribe gap and leave this waiting forever.
         let mut owners_changed = self.inner.run_owners_changed.subscribe();
-        let mut shutting_down = self.inner.shutting_down.subscribe();
         loop {
             if !self.has_live_run(chat_id) {
                 return true;
             }
-            if *shutting_down.borrow() {
+            if self.inner.shutdown.is_cancelled() {
                 return false;
             }
             tokio::select! {
@@ -980,10 +979,8 @@ impl SessionsEngine {
                         return false;
                     }
                 }
-                changed = shutting_down.changed() => {
-                    if changed.is_err() || *shutting_down.borrow_and_update() {
-                        return false;
-                    }
+                () = self.inner.shutdown.cancelled() => {
+                    return false;
                 }
             }
         }
@@ -1350,7 +1347,7 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
-        self.inner.shutting_down.send_replace(true);
+        self.inner.shutdown.cancel();
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1380,8 +1377,7 @@ impl Inner {
             .or_default()
             .insert(run_id);
         if inserted {
-            self.run_owners_changed
-                .send_modify(|generation| *generation += 1);
+            let _ = self.run_owners_changed.send(());
         }
         lock(&self.runs).insert(chat_id.to_string(), run_handle)
     }
@@ -1404,8 +1400,7 @@ impl Inner {
             removed
         };
         if removed {
-            self.run_owners_changed
-                .send_modify(|generation| *generation += 1);
+            let _ = self.run_owners_changed.send(());
         }
     }
 
