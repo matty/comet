@@ -246,12 +246,17 @@ fn model_deprecation_guidance(
         .map(compact_migration_markdown)
         .filter(|message| !message.is_empty())
         .unwrap_or_else(|| "This model is being retired.".to_string());
-    let action = catalog
-        .iter()
-        .find(|candidate| candidate.id == deprecation.replacement && candidate.id != model.id)
-        .map(|replacement| ModelUpgradeAction {
-            model_id: replacement.id.clone(),
-            label: format!("Use {}", replacement.label),
+    let action = deprecation
+        .replacement
+        .as_deref()
+        .and_then(|replacement_id| {
+            catalog
+                .iter()
+                .find(|candidate| candidate.id == replacement_id && candidate.id != model.id)
+                .map(|replacement| ModelUpgradeAction {
+                    model_id: replacement.id.clone(),
+                    label: format!("Use {}", replacement.label),
+                })
         });
     Some(ModelDeprecationGuidance { message, action })
 }
@@ -4892,7 +4897,7 @@ mod tests {
             label: "Old".into(),
             description: None,
             deprecation: Some(ModelDeprecation {
-                replacement: "new".into(),
+                replacement: Some("new".into()),
                 migration_markdown: Some(
                     "Old retires soon.\n\n  Switch to **New** to continue.".into(),
                 ),
@@ -4931,7 +4936,7 @@ mod tests {
             label: "Old".into(),
             description: None,
             deprecation: Some(ModelDeprecation {
-                replacement: "missing".into(),
+                replacement: Some("missing".into()),
                 migration_markdown: None,
             }),
             reasoning_levels: vec![],
@@ -4942,6 +4947,27 @@ mod tests {
         let guidance = model_deprecation_guidance(&old, std::slice::from_ref(&old))
             .expect("the advisory still displays");
         assert_eq!(guidance.message, "This model is being retired.");
+        assert_eq!(guidance.action, None);
+    }
+
+    #[test]
+    fn deprecation_guidance_keeps_copy_without_a_replacement() {
+        let old = Model {
+            id: "old".into(),
+            label: "Old".into(),
+            description: None,
+            deprecation: Some(ModelDeprecation {
+                replacement: None,
+                migration_markdown: Some("Old retires soon.".into()),
+            }),
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+
+        let guidance = model_deprecation_guidance(&old, std::slice::from_ref(&old))
+            .expect("guidance survives without an action");
+        assert_eq!(guidance.message, "Old retires soon.");
         assert_eq!(guidance.action, None);
     }
 
@@ -4978,7 +5004,7 @@ mod tests {
             .deprecation
             .as_ref()
             .expect("additive advisory metadata decodes at the RPC call site");
-        assert_eq!(advice.replacement, "claude-sonnet-6");
+        assert_eq!(advice.replacement.as_deref(), Some("claude-sonnet-6"));
         assert_eq!(
             advice.migration_markdown.as_deref(),
             Some("Sonnet 5 retires soon. Switch to Sonnet 6.")

@@ -369,7 +369,7 @@ mod tests {
     fn matched_id_receives_live_deprecation_guidance() {
         let mut live = discovered("m-1", "Live Label");
         live.deprecation = Some(ModelDeprecation {
-            replacement: "m-2".into(),
+            replacement: Some("m-2".into()),
             migration_markdown: Some("Move soon".into()),
         });
         let merged = merge(
@@ -380,7 +380,7 @@ mod tests {
             merged[0]
                 .deprecation
                 .as_ref()
-                .map(|d| d.replacement.as_str()),
+                .and_then(|d| d.replacement.as_deref()),
             Some("m-2")
         );
     }

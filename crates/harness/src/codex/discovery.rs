@@ -440,23 +440,23 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
         // this is what keeps that true if the default ever changes.
         .filter(|model| !model.hidden)
         .map(|model| {
-            let deprecation = model.upgrade.map(|replacement| {
-                let migration_markdown = model
-                    .upgrade_info
-                    .and_then(|info| info.migration_markdown)
-                    .map(|markdown| {
-                        tracing::debug!(
-                            model = %model.id,
-                            migration_markdown = %markdown,
-                            "codex reported model migration guidance"
-                        );
-                        crate::cap_prose(&markdown, crate::MODEL_MIGRATION_MARKDOWN_MAX)
-                    });
+            let migration_markdown = model
+                .upgrade_info
+                .and_then(|info| info.migration_markdown)
+                .map(|markdown| {
+                    tracing::debug!(
+                        model = %model.id,
+                        migration_markdown = %markdown,
+                        "codex reported model migration guidance"
+                    );
+                    crate::cap_prose(&markdown, crate::MODEL_MIGRATION_MARKDOWN_MAX)
+                });
+            let deprecation = (model.upgrade.is_some() || migration_markdown.is_some()).then_some(
                 ModelDeprecation {
-                    replacement,
+                    replacement: model.upgrade,
                     migration_markdown,
-                }
-            });
+                },
+            );
             DiscoveredModel {
                 label: model.display_name.unwrap_or_else(|| model.id.clone()),
                 id: model.id,
@@ -512,7 +512,7 @@ mod tests {
             .deprecation
             .as_ref()
             .expect("captured upgrade advice");
-        assert_eq!(advice.replacement, "gpt-5.6-terra");
+        assert_eq!(advice.replacement.as_deref(), Some("gpt-5.6-terra"));
         assert!(
             advice
                 .migration_markdown
@@ -545,7 +545,7 @@ mod tests {
 
         let (models, _, _) = page_from_reply(&line).expect("decodes");
         let advice = models[0].deprecation.as_ref().expect("upgrade advice");
-        assert_eq!(advice.replacement, "gpt-new");
+        assert_eq!(advice.replacement.as_deref(), Some("gpt-new"));
         let markdown = advice
             .migration_markdown
             .as_deref()
@@ -561,6 +561,20 @@ mod tests {
         let line = r#"{"id":2,"result":{"data":[{"id":"gpt-current","displayName":"Current","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
         let (models, _, _) = page_from_reply(line).expect("decodes");
         assert_eq!(models[0].deprecation, None);
+    }
+
+    /// Migration copy is useful even when Codex does not name a selectable
+    /// replacement. Keep the warning while leaving the picker action absent.
+    #[test]
+    fn migration_copy_survives_without_a_replacement_id() {
+        let line = r#"{"id":2,"result":{"data":[{"id":"gpt-old","displayName":"Old","hidden":false,"supportedReasoningEfforts":[],"upgradeInfo":{"migrationMarkdown":"This model retires soon."}}],"nextCursor":null}}"#;
+        let (models, _, _) = page_from_reply(line).expect("decodes");
+        let advice = models[0].deprecation.as_ref().expect("warning survives");
+        assert_eq!(advice.replacement, None);
+        assert_eq!(
+            advice.migration_markdown.as_deref(),
+            Some("This model retires soon.")
+        );
     }
 
     /// The wire fact this whole change reads: `isDefault` can name a row that

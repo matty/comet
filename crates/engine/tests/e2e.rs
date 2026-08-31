@@ -4546,7 +4546,7 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
             label: "Tomorrow".into(),
             description: None,
             deprecation: Some(ModelDeprecation {
-                replacement: "mock-1".into(),
+                replacement: Some("mock-1".into()),
                 migration_markdown: Some("Tomorrow is retiring.".into()),
             }),
             reasoning_levels: vec![ReasoningLevel::High],

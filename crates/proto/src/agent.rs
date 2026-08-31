@@ -946,8 +946,10 @@ pub struct Model {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDeprecation {
-    /// Model id the provider recommends in place of this one.
-    pub replacement: String,
+    /// Model id the provider recommends in place of this one. Some provider
+    /// replies carry warning copy without naming a selectable replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
     /// Provider migration copy, bounded before entering this RPC type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_markdown: Option<String>,
@@ -2256,6 +2258,20 @@ mod tests {
         assert!(
             encoded.get("deprecation").is_none(),
             "an old peer should keep receiving the pre-advisory shape: {encoded}"
+        );
+    }
+
+    #[test]
+    fn deprecation_copy_does_not_require_a_replacement_id() {
+        let model: Model = serde_json::from_str(
+            r#"{"id":"m","label":"M","deprecation":{"migrationMarkdown":"Retires soon."},"reasoningLevels":[],"options":[]}"#,
+        )
+        .unwrap();
+        let deprecation = model.deprecation.expect("advisory metadata");
+        assert_eq!(deprecation.replacement, None);
+        assert_eq!(
+            deprecation.migration_markdown.as_deref(),
+            Some("Retires soon.")
         );
     }
 
