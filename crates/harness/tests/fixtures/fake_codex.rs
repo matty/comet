@@ -370,12 +370,16 @@ fn main() {
         simple_completed(&tid);
     } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
-    // NOTE: steer-race-orphan before steer-race before steer — each is a prefix
-    // of the next broader scenario marker.
+    // NOTE: steer-race variants before steer-race before steer — each is a
+    // prefix of the next broader scenario marker.
     } else if turn_line.contains("scenario:steer-race-orphan") {
-        steer_race(&mut stdin, &tid, true);
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::OrphanEarly);
+    } else if turn_line.contains("scenario:steer-race-second-steer") {
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::SecondSteer);
+    } else if turn_line.contains("scenario:steer-race-missing-start") {
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::MissingStarted);
     } else if turn_line.contains("scenario:steer-race") {
-        steer_race(&mut stdin, &tid, false);
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::Normal);
     } else if turn_line.contains("scenario:steer")
         // The real capture-recorder prompt (`record/scenarios/codex.rs`'s
         // `steer_request`), additive alongside the `scenario:steer` test
@@ -589,7 +593,15 @@ fn auto_reviewer(thread_line: &str, tid: &str) {
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 
-fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, orphan_after_completion: bool) {
+#[derive(Clone, Copy)]
+enum SteerRaceFollowup {
+    Normal,
+    OrphanEarly,
+    MissingStarted,
+    SecondSteer,
+}
+
+fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, followup: SteerRaceFollowup) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
@@ -608,7 +620,10 @@ fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, orphan_after_completion: boo
         r#"{{"id":{sid},"error":{{"code":-32602,"message":"turn already completed"}}}}"#
     ));
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
-    if orphan_after_completion {
+    if matches!(
+        followup,
+        SteerRaceFollowup::OrphanEarly | SteerRaceFollowup::SecondSteer
+    ) {
         // This old-turn frame is already queued before the follow-up starts.
         emit(
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#,
@@ -618,12 +633,57 @@ fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, orphan_after_completion: boo
     let follow_line = read_line(stdin);
     let fid = rid(&follow_line);
     if follow_line.contains(r#""method":"turn/start""#) && follow_line.contains("redirect please") {
-        emit(&format!(
-            r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
-        ));
-        emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
-        emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#);
-        emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+        match followup {
+            SteerRaceFollowup::Normal => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                emit(
+                    r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#,
+                );
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::OrphanEarly => {
+                // A legal follow-up lifecycle and delta can beat its response.
+                emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                emit(
+                    r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#,
+                );
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::MissingStarted => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::SecondSteer => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                let second_line = read_line(stdin);
+                let sid = rid(&second_line);
+                if second_line.contains(r#""method":"turn/steer""#)
+                    && second_line.contains(r#""expectedTurnId":"t-2""#)
+                    && second_line.contains("redirect again")
+                {
+                    emit(&format!(r#"{{"id":{sid},"result":{{}}}}"#));
+                    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                    emit(
+                        r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"second-steer"}}"#,
+                    );
+                    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+                } else {
+                    emit(&format!(
+                        r#"{{"id":{sid},"error":{{"code":-32602,"message":"expected second steer for t-2"}}}}"#
+                    ));
+                }
+            }
+        }
     } else {
         fail_turn(&fid, "expected fallback turn/start with steer text");
     }

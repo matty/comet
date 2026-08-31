@@ -799,6 +799,12 @@ async fn rejected_steer_drops_an_orphan_queued_before_the_follow_up() {
         .iter()
         .position(|event| matches!(event, AgentEvent::Steered { .. }))
         .expect("fallback Steered event: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "orphaned")),
+        "old-turn content must not appear before or after Steered: {events:?}"
+    );
     let post_steer_deltas: Vec<_> = events[steered_pos + 1..]
         .iter()
         .filter_map(|event| match event {
@@ -810,6 +816,96 @@ async fn rejected_steer_drops_an_orphan_queued_before_the_follow_up() {
         post_steer_deltas,
         vec!["fallback"],
         "only follow-up content may enter the assistant entry after Steered: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn second_steer_targets_the_first_follow_up_before_its_started_notice() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("first steer queued");
+    let mut stream = harness()
+        .run(request("scenario:steer-race-second-steer"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut second_sent = false;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event");
+            if !second_sent && matches!(event, AgentEvent::Done { .. }) {
+                steer
+                    .send(SteerMessage {
+                        prompt: "redirect again".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("second steer queued after first completion");
+                second_sent = true;
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("run finishes");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        2,
+        "fallback then native second steer: {events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "second-steer".into()
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "orphaned")),
+        "the first follow-up owns no old-turn content: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_without_started_still_emits_steered_and_finishes() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:steer-race-missing-start"),
+        controls,
+    )
+    .await;
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "the follow-up response owns its lifecycle even without turn/started: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        2,
+        "both turns terminate without waiting for turn/started: {events:?}"
     );
 }
 
