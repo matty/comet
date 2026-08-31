@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{ClientFrame, RpcError, ServerFrame};
+use crate::{ClientFrame, ClientHello, ClientPresence, RpcError, ServerFrame};
 
 /// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
 /// the connection reader — transport backpressure instead of unbounded growth
@@ -67,7 +67,11 @@ async fn run_writer(
     transport: mpsc::Sender<String>,
     mut requests: mpsc::Receiver<WriteRequest>,
     mut cancels: mpsc::Receiver<String>,
+    hello: String,
 ) {
+    if transport.send(hello).await.is_err() {
+        return;
+    }
     loop {
         tokio::select! {
             biased;
@@ -138,13 +142,32 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Wrap an existing duplex: `out` carries client frames, `inbound` server frames.
-    pub fn new(out: mpsc::Sender<String>, mut inbound: mpsc::Receiver<String>) -> Self {
+    pub fn new(out: mpsc::Sender<String>, inbound: mpsc::Receiver<String>) -> Self {
+        Self::new_with_presence(out, inbound, ClientPresence::Supervising)
+    }
+
+    /// Wrap an existing duplex and declare whether it supervises waiting work.
+    pub fn new_with_presence(
+        out: mpsc::Sender<String>,
+        mut inbound: mpsc::Receiver<String>,
+        presence: ClientPresence,
+    ) -> Self {
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
         });
         let (requests, request_rx) = mpsc::channel(256);
         let (cancels, cancel_rx) = mpsc::channel(64);
-        let writer = tokio::spawn(run_writer(out, request_rx, cancel_rx));
+        let hello = serde_json::to_string(&ClientFrame {
+            id: 0,
+            method: None,
+            params: serde_json::Value::Null,
+            cancel: false,
+            hello: Some(ClientHello {
+                supervising: presence.supervising(),
+            }),
+        })
+        .expect("client hello is always serializable");
+        let writer = tokio::spawn(run_writer(out, request_rx, cancel_rx, hello));
         let reader_shared = shared.clone();
         let reader = tokio::spawn(async move {
             while let Some(payload) = inbound.recv().await {
@@ -208,6 +231,7 @@ impl RpcClient {
             method: Some(method.into()),
             params,
             cancel: false,
+            hello: None,
         })
         .await
         .inspect_err(|_| {
@@ -249,6 +273,7 @@ impl RpcClient {
             method: Some(method.into()),
             params,
             cancel: false,
+            hello: None,
         })
         .await
         .inspect_err(|_| {
@@ -296,6 +321,7 @@ fn cancel_frame(id: u64) -> Result<String, serde_json::Error> {
         method: None,
         params: serde_json::Value::Null,
         cancel: true,
+        hello: None,
     })
 }
 
@@ -369,6 +395,14 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`).
 pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
+    connect_ws_with_presence(url, ClientPresence::Supervising).await
+}
+
+/// Dial a WebSocket RPC server with explicit connection presence intent.
+pub async fn connect_ws_with_presence(
+    url: &str,
+    presence: ClientPresence,
+) -> Result<RpcClient, RpcError> {
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
         .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
@@ -402,7 +436,7 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
             }
         }
     });
-    Ok(RpcClient::new(out_tx, in_rx))
+    Ok(RpcClient::new_with_presence(out_tx, in_rx, presence))
 }
 
 #[cfg(test)]

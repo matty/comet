@@ -24,7 +24,7 @@ mod pairing;
 mod server;
 mod tls;
 
-pub use client::{RpcClient, RpcStream, connect_ws};
+pub use client::{RpcClient, RpcStream, connect_ws, connect_ws_with_presence};
 pub use pairing::{
     PairingAttempt, PairingLimit, PairingLimiter, PairingSession, PairingTranscript,
 };
@@ -137,6 +137,33 @@ pub struct ClientFrame {
     pub params: serde_json::Value,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello: Option<ClientHello>,
+}
+
+/// Connection-level intent sent before the first RPC request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHello {
+    #[serde(default = "default_supervising")]
+    pub supervising: bool,
+}
+
+fn default_supervising() -> bool {
+    true
+}
+
+/// Whether this connection represents a viewport that can answer waiting work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientPresence {
+    Supervising,
+    Administrative,
+}
+
+impl ClientPresence {
+    pub(crate) fn supervising(self) -> bool {
+        matches!(self, Self::Supervising)
+    }
 }
 
 /// A server-originated frame. Exactly one of `ok` / `err` / `item` / `done` is meaningful.
@@ -187,7 +214,7 @@ pub trait RpcService: Send + Sync + 'static {
     /// Defaulted to `None` so existing services are unaffected. A wrapping
     /// service MUST forward this to its inner service or the count silently
     /// misses everything behind the wrapper.
-    fn attached(&self) -> Option<ConnectionLease> {
+    fn attached(&self, _presence: ClientPresence) -> Option<ConnectionLease> {
         None
     }
 }
@@ -203,10 +230,18 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 /// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
 /// transport (ARCHITECTURE §1 "zero serialization shortcuts").
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
+    memory_client_with_presence(service, ClientPresence::Supervising)
+}
+
+/// In-memory transport with explicit connection presence intent.
+pub fn memory_client_with_presence(
+    service: Arc<dyn RpcService>,
+    presence: ClientPresence,
+) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, server_out, server_in));
-    RpcClient::new(client_out, client_in)
+    RpcClient::new_with_presence(client_out, client_in, presence)
 }
 
 #[cfg(test)]
@@ -215,6 +250,21 @@ mod tests {
     use futures::StreamExt;
 
     struct TestService;
+
+    #[test]
+    fn client_hello_literal_defaults_old_and_missing_intent_to_supervising() {
+        let old: ClientFrame =
+            serde_json::from_str(r#"{"id":1,"method":"Echo","params":null,"cancel":false}"#)
+                .unwrap();
+        assert!(old.hello.is_none());
+
+        let missing: ClientFrame = serde_json::from_str(r#"{"id":0,"hello":{}}"#).unwrap();
+        assert!(missing.hello.unwrap().supervising);
+
+        let administrative: ClientFrame =
+            serde_json::from_str(r#"{"id":0,"hello":{"supervising":false}}"#).unwrap();
+        assert!(!administrative.hello.unwrap().supervising);
+    }
 
     #[async_trait]
     impl RpcService for TestService {

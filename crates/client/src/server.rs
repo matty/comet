@@ -1009,15 +1009,20 @@ mod tests {
         RpcClient::new(out, inbound)
     }
 
-    fn controllable_transport() -> (RpcClient, mpsc::Sender<String>, mpsc::Receiver<String>) {
-        let (out, outbound) = mpsc::channel(1);
+    /// Drains the client hello before handing back the transport: every
+    /// `RpcClient` now writes it as frame zero, and callers here assert on
+    /// exact frame counts/positions for the requests that follow it.
+    async fn controllable_transport() -> (RpcClient, mpsc::Sender<String>, mpsc::Receiver<String>) {
+        let (out, mut outbound) = mpsc::channel(1);
         let control = out.clone();
         let (inbound_sender, inbound) = mpsc::channel(1);
         tokio::spawn(async move {
             let _inbound_sender = inbound_sender;
             futures::future::pending::<()>().await;
         });
-        (RpcClient::new(out, inbound), control, outbound)
+        let client = RpcClient::new(out, inbound);
+        outbound.recv().await.expect("client hello");
+        (client, control, outbound)
     }
 
     async fn wait_online(events: &mut mpsc::UnboundedReceiver<FederationEvent>) {
@@ -1060,7 +1065,10 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_interrupts_a_transcript_subscription() {
-        let (task, commands, mut events) = spawn_with_client(backpressured_client(4, 0));
+        // Capacity 5, not 4: the client hello now occupies the first slot, so
+        // 5 is what exactly holds it plus the four startup watch requests —
+        // leaving the transcript subscription below as the one that blocks.
+        let (task, commands, mut events) = spawn_with_client(backpressured_client(5, 0));
         wait_online(&mut events).await;
         commands
             .send(SupervisorCommand::WatchTranscript {
@@ -1541,7 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn promoting_queued_requests_skips_a_closed_receiver_before_its_rpc_starts() {
-        let (client, _transport, mut outbound) = controllable_transport();
+        let (client, _transport, mut outbound) = controllable_transport().await;
         let (reply, closed) = tokio::sync::oneshot::channel();
         drop(closed);
         let (next_reply, _next) = tokio::sync::oneshot::channel();
@@ -1651,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_interrupts_a_stalled_subscription_handshake() {
-        let (client, transport, mut outbound) = controllable_transport();
+        let (client, transport, mut outbound) = controllable_transport().await;
         let (task, commands, mut events) = spawn_with_client(client);
         for _ in 0..4 {
             outbound.recv().await.expect("initial watch request");
@@ -1761,7 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_pending_subscription_reply_cancels_its_transport_send() {
-        let (client, transport, mut outbound) = controllable_transport();
+        let (client, transport, mut outbound) = controllable_transport().await;
         let (task, commands, mut events) = spawn_with_client(client);
         for _ in 0..4 {
             outbound.recv().await.expect("initial watch request");
@@ -1794,7 +1802,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_subscription_setup_overflow_returns_an_error() {
-        let (client, transport, mut outbound) = controllable_transport();
+        let (client, transport, mut outbound) = controllable_transport().await;
         let (task, commands, mut events) = spawn_with_client(client);
         for _ in 0..4 {
             outbound.recv().await.expect("initial watch request");

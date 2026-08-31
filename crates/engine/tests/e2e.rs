@@ -4149,6 +4149,34 @@ async fn an_in_memory_client_counts_as_an_attached_supervisor() {
     .await;
 }
 
+/// A one-shot administrative call can inspect the engine, but cannot answer a
+/// waiting run. Counting it would clear and then restart the unattended
+/// stretch on every scheduled `comet status` poll.
+#[tokio::test]
+async fn an_administrative_client_does_not_reset_unattended_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness::with_script(mock_script())),
+    );
+    let before = core.presence().unattended_since();
+
+    let client = comet_rpc::memory_client_with_presence(
+        core.rpc_service(),
+        comet_rpc::ClientPresence::Administrative,
+    );
+    client
+        .call(comet_rpc::methods::SERVER_HELLO, serde_json::Value::Null)
+        .await
+        .unwrap();
+
+    assert_eq!(core.presence().attached_count(), 0);
+    assert_eq!(core.presence().unattended_since(), before);
+    drop(client);
+    tokio::task::yield_now().await;
+    assert_eq!(core.presence().unattended_since(), before);
+}
+
 /// `RemoteRpcService` wraps `EngineRpc`; a defaulted `attached()` compiles and
 /// silently loses every LAN client. This is the topology `remote_access.rs`
 /// exercises for RPC behavior — here it stands in as the "LAN-shaped" client
@@ -4201,6 +4229,18 @@ async fn an_unanswerable_approval_expires_the_turn_without_inventing_a_decision(
         )
         .await;
     assert_eq!(ended, 1, "the blocked run should have been ended");
+
+    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
+    let done = replay
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event, AgentEvent::Done { .. }))
+        .expect("the expired run has a terminal event");
+    assert_eq!(
+        serde_json::to_value(&done.event).unwrap()["status"],
+        serde_json::json!("expired"),
+        "an unattended expiry must not be recorded as a user's interruption"
+    );
 
     wait_for(
         || {
