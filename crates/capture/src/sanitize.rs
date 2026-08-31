@@ -242,7 +242,14 @@ pub fn sanitize_dir(
     for (event, payload) in capture.events.iter().zip(&mut payloads) {
         let payload = match payload {
             Payload::Json(value) => {
-                redactor.sanitize_value_tree(value, capture.provider, "", "", "event.payload")?;
+                redactor.sanitize_value_tree(
+                    value,
+                    capture.provider,
+                    "",
+                    "",
+                    "",
+                    "event.payload",
+                )?;
                 serde_json::to_string(value)
                     .map_err(|source| SanitizationError::EncodeOutput { source })?
             }
@@ -740,23 +747,28 @@ impl Redactor {
     /// an index, so every element of an array shares one allowlist
     /// decision) and its `key` stays the containing field's key, so
     /// `is_secret_field`/`named_kind` still see a meaningful field name for
-    /// each scalar inside e.g. `"tags": ["sk-ant-…"]`.
+    /// each scalar inside e.g. `"tags": ["sk-ant-…"]`. `diagnostic_path`
+    /// separately folds data-shaped keys, so a suspected descendant map
+    /// cannot reveal an unreviewed ancestor key.
     fn sanitize_value_tree(
         &mut self,
         value: &mut Value,
         provider: Provider,
         path: &str,
+        diagnostic_path: &str,
         key: &str,
         location: &str,
     ) -> Result<(), SanitizationError> {
         match value {
             Value::Array(items) => {
                 let child_path = format!("{path}[]");
+                let diagnostic_child_path = format!("{diagnostic_path}[]");
                 for (index, item) in items.iter_mut().enumerate() {
                     self.sanitize_value_tree(
                         item,
                         provider,
                         &child_path,
+                        &diagnostic_child_path,
                         key,
                         &format!("{location}[{index}]"),
                     )?;
@@ -790,7 +802,7 @@ impl Redactor {
                 // rebuild loop below consumes `object`.
                 if !is_map
                     && let Some(found) =
-                        surface::suspected_map(path, object.keys().map(String::as_str))
+                        surface::suspected_map(diagnostic_path, object.keys().map(String::as_str))
                 {
                     self.suspected.entry(found.path.clone()).or_insert(found);
                 }
@@ -803,6 +815,11 @@ impl Redactor {
                     let escaped_key = surface::escape_path_segment(&child_key);
                     let key_needed_escaping = matches!(escaped_key, std::borrow::Cow::Owned(_));
                     let candidate_path = format!("{path}.{escaped_key}");
+                    let diagnostic_child_path = if surface::is_identifier_shaped(&child_key) {
+                        format!("{diagnostic_path}.{escaped_key}")
+                    } else {
+                        format!("{diagnostic_path}.{{}}")
+                    };
                     let key_survives = !is_map
                         || surface::is_named_map_child(path, &child_key)
                         || allows_prefix(provider, &candidate_path);
@@ -834,6 +851,7 @@ impl Redactor {
                         &mut child,
                         provider,
                         &child_path,
+                        &diagnostic_child_path,
                         &child_key,
                         &child_location,
                     )?;
@@ -1982,7 +2000,7 @@ mod tests {
     fn try_sanitize_value(value: Value, provider: Provider) -> Result<Value, SanitizationError> {
         let mut value = value;
         let mut redactor = Redactor::default();
-        redactor.sanitize_value_tree(&mut value, provider, "", "", "value")?;
+        redactor.sanitize_value_tree(&mut value, provider, "", "", "", "value")?;
         Ok(value)
     }
 
@@ -1996,7 +2014,7 @@ mod tests {
         let mut value = value;
         let mut redactor = Redactor::default();
         redactor
-            .sanitize_value_tree(&mut value, provider, "", "", "value")
+            .sanitize_value_tree(&mut value, provider, "", "", "", "value")
             .expect("test value expected to sanitize cleanly");
         let events_bytes = serde_json::to_vec(&value).expect("sanitized value encodes");
         let novel_paths = redactor.novel_paths();
@@ -2480,7 +2498,7 @@ mod tests {
         let mut redactor = Redactor::default();
         let mut payload = json!({"echo": "sess-abc", "session_id": "sess-abc"});
         redactor
-            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "", "value")
             .expect("the payload sanitizes");
         let mut command = json!({"args": ["--resume=sess-abc"]});
 
@@ -2506,7 +2524,7 @@ mod tests {
         let mut payload =
             json!({"session_id": "sess-parent", "child": {"session_id": "sess-child"}});
         redactor
-            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "", "value")
             .expect("the payload sanitizes");
         let mut command = json!({"args": ["--resume=sess-parent"]});
 
@@ -2530,7 +2548,7 @@ mod tests {
         let mut redactor = Redactor::default();
         let mut payload = json!({"session_id": "sess-abc"});
         redactor
-            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "value")
+            .sanitize_value_tree(&mut payload, Provider::Claude, "", "", "", "value")
             .expect("the payload sanitizes");
         let mut command = json!({"args": ["--resume=sess-never-observed"]});
 

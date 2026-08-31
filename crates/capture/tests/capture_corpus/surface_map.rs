@@ -760,6 +760,40 @@ fn sanitize_dir_rejects_an_undeclared_object_keyed_by_account_ids_without_printi
     );
 }
 
+/// An undeclared parent can be mixed, so its one data-shaped child may not
+/// trigger D77 until a nested object does. That ancestor key is still data and
+/// must not become part of the nested diagnostic path.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_a_mixed_parent_data_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-undeclared-account-map",
+        &[
+            r#"{"type":"system","subtype":"init","accounts":{"primary":{},"acct-private-42":{"model-7f2c":{},"model-04b6":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-undeclared-account-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".accounts.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".accounts.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("acct-private-42"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
 /// The false-negative-avoidance half: an object whose keys are ordinary
 /// field names must still stage successfully.
 #[test]
