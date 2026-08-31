@@ -1423,6 +1423,7 @@ pub struct UserInputAnswer {
 pub enum DoneStatus {
     Completed,
     Interrupted,
+    Expired,
     Errored,
 }
 
@@ -2512,6 +2513,25 @@ mod tests {
         ] {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<RuntimeMode>(&json).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn done_status_preserves_old_values_and_adds_expired() {
+        for (wire, expected) in [
+            ("completed", DoneStatus::Completed),
+            ("interrupted", DoneStatus::Interrupted),
+            ("errored", DoneStatus::Errored),
+            ("expired", DoneStatus::Expired),
+        ] {
+            let json = format!(
+                r#"{{"type":"done","status":"{wire}","result":null,"error":null,"sessionId":null}}"#
+            );
+            let event: AgentEvent = serde_json::from_str(&json).unwrap();
+            assert!(matches!(
+                event,
+                AgentEvent::Done { status, .. } if status == expected
+            ));
         }
     }
 

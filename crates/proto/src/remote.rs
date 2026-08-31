@@ -65,7 +65,13 @@ use serde::{Deserialize, Serialize};
 ///     have granted an argument set the old client never showed. Refusing the
 ///     pair preserves informed approval instead of treating exact enforcement
 ///     as a substitute for a visible request.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: `DoneStatus::Expired`. The new status crosses inside `AgentEvent::Done`,
+///     so an older peer fails the containing event rather than learning why an
+///     unattended turn ended. D29's additive client hello rides the same
+///     release but does not itself require the bump: a new server defaults a
+///     missing hello to supervising, while an old server ignoring an
+///     administrative declaration preserves the old safe behavior.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -293,8 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_argument_identity_requires_protocol_version_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn expired_done_status_requires_protocol_version_thirteen() {
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
