@@ -351,6 +351,11 @@ pub struct SessionsEngine {
     inner: Arc<Inner>,
 }
 
+enum DispatchGeneration {
+    RetryDoc(Arc<SessionDoc>),
+    CommandHandle(Arc<ChatDocHandle>),
+}
+
 impl SessionsEngine {
     pub fn new(
         device_id: String,
@@ -575,6 +580,24 @@ impl SessionsEngine {
             .await
     }
 
+    pub(crate) async fn dispatch_for_generation(
+        &self,
+        generation: &Arc<ChatDocHandle>,
+        harness_id: HarnessId,
+        request: RunRequest,
+        message_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        self.dispatch_with(
+            generation.chat_id(),
+            harness_id,
+            request,
+            message_id,
+            true,
+            Some(DispatchGeneration::CommandHandle(generation.clone())),
+        )
+        .await
+    }
+
     /// [`Self::dispatch`] with resume injection controllable: the failed-resume
     /// retry re-dispatches with `inject_resume = false` so a session id the
     /// harness just rejected can never be re-injected from the journal.
@@ -587,7 +610,7 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
         inject_resume: bool,
-        expected_doc: Option<Arc<SessionDoc>>,
+        expected_generation: Option<DispatchGeneration>,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(self.dispatch_inner(
             chat_id,
@@ -595,7 +618,7 @@ impl SessionsEngine {
             request,
             message_id,
             inject_resume,
-            expected_doc,
+            expected_generation,
         ))
     }
 
@@ -615,7 +638,7 @@ impl SessionsEngine {
             request,
             Some(message_id),
             false,
-            Some(expected_doc),
+            Some(DispatchGeneration::RetryDoc(expected_doc)),
         )
     }
 
@@ -626,16 +649,31 @@ impl SessionsEngine {
         mut request: RunRequest,
         message_id: Option<String>,
         inject_resume: bool,
-        expected_doc: Option<Arc<SessionDoc>>,
+        expected_generation: Option<DispatchGeneration>,
     ) -> Result<String, EngineError> {
-        let routed = expected_doc
-            .is_none()
-            .then(|| {
+        let expected_handle = match expected_generation.as_ref() {
+            Some(DispatchGeneration::CommandHandle(handle)) => Some(handle),
+            _ => None,
+        };
+        let routed = if !matches!(
+            expected_generation.as_ref(),
+            Some(DispatchGeneration::RetryDoc(_))
+        ) {
+            let route = || {
                 lock(&self.inner.runs)
                     .get(chat_id)
                     .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()))
-            })
-            .flatten();
+            };
+            match expected_handle {
+                Some(handle) => self
+                    .doc_host()?
+                    .with_current_handle(handle, route)
+                    .ok_or(EngineError::ChatCleanupPendingRetry)?,
+                None => route(),
+            }
+        } else {
+            None
+        };
         if let Some((run_id, steerable, steer_tx)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
@@ -643,8 +681,14 @@ impl SessionsEngine {
             };
             if steerable && steer_tx.try_send(message).is_ok() {
                 let user_id = message_id.unwrap_or_else(new_id);
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                if let Some(handle) = expected_handle {
+                    self.doc_host()?.require_current(handle, || {
+                        handle.write_user_message(&user_id, &request.prompt, now_ms())
+                    })??;
+                } else {
+                    let handle = self.doc_handle(chat_id)?;
+                    handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                }
                 // Working BEFORE the lastMessageAt bump: both ride the
                 // workspace doc from this one peer, so causal order makes it
                 // impossible for an observer to hold [new message, old status]
@@ -655,11 +699,18 @@ impl SessionsEngine {
                 return Ok(run_id);
             }
             // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
-            self.interrupt(chat_id).await?;
+            if expected_handle.is_some() {
+                self.interrupt_run(chat_id, &run_id).await?;
+            } else {
+                self.interrupt(chat_id).await?;
+            }
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
-        let handle = self.doc_handle(chat_id)?;
+        let handle = match expected_handle {
+            Some(handle) => handle.clone(),
+            None => self.doc_handle(chat_id)?,
+        };
         let user_id = message_id.unwrap_or_else(new_id);
 
         // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
@@ -818,7 +869,7 @@ impl SessionsEngine {
         let registration = self
             .doc_host()?
             .register_run_if_current(&handle, |run_doc| {
-                if let Some(expected) = expected_doc.as_ref() {
+                if let Some(DispatchGeneration::RetryDoc(expected)) = expected_generation.as_ref() {
                     if !Arc::ptr_eq(expected, &run_doc) {
                         return Err(EngineError::ChatCleanupPendingRetry);
                     }
@@ -855,7 +906,12 @@ impl SessionsEngine {
         // answer — see `TitleGenerator::maybe_generate_upfront`'s doc for
         // the policy.
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate_upfront(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate_upfront(
+                handle.clone(),
+                harness_id,
+                &request.prompt,
+                &request.cwd,
+            );
         }
 
         tokio::spawn(drive_run(
@@ -864,6 +920,7 @@ impl SessionsEngine {
             run_id.clone(),
             harness,
             request,
+            handle,
             run_doc,
             controls,
             engine_rx,
@@ -910,8 +967,31 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
-        self.interrupt_with_status(chat_id, DoneStatus::Interrupted)
+        self.interrupt_matching(chat_id, None, DoneStatus::Interrupted)
             .await
+    }
+
+    async fn interrupt_run(&self, chat_id: &str, run_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_matching(chat_id, Some(run_id), DoneStatus::Interrupted)
+            .await
+    }
+
+    pub(crate) async fn interrupt_for_generation(
+        &self,
+        generation: &Arc<ChatDocHandle>,
+    ) -> Result<bool, EngineError> {
+        let run_id = self
+            .doc_host()?
+            .with_current_handle(generation, || {
+                lock(&self.inner.runs)
+                    .get(generation.chat_id())
+                    .map(|handle| handle.run_id.clone())
+            })
+            .ok_or(EngineError::ChatCleanupPendingRetry)?;
+        match run_id {
+            Some(run_id) => self.interrupt_run(generation.chat_id(), &run_id).await,
+            None => Ok(false),
+        }
     }
 
     async fn interrupt_with_status(
@@ -919,16 +999,31 @@ impl SessionsEngine {
         chat_id: &str,
         terminal_status: DoneStatus,
     ) -> Result<bool, EngineError> {
-        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
-            (
-                h.run_id.clone(),
-                h.interrupt_token.clone(),
-                h.cancel.clone(),
-                h.pending_inputs.clone(),
-                h.pending_approvals.clone(),
-                h.minted_approvals.clone(),
-            )
-        });
+        self.interrupt_matching(chat_id, None, terminal_status)
+            .await
+    }
+
+    /// The one implementation. `expected_run_id` bounds the interrupt to an exact
+    /// run (D82); `terminal_status` is the reason the settle records (D26).
+    async fn interrupt_matching(
+        &self,
+        chat_id: &str,
+        expected_run_id: Option<&str>,
+        terminal_status: DoneStatus,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|handle| expected_run_id.is_none_or(|expected| handle.run_id == expected))
+            .map(|h| {
+                (
+                    h.run_id.clone(),
+                    h.interrupt_token.clone(),
+                    h.cancel.clone(),
+                    h.pending_inputs.clone(),
+                    h.pending_approvals.clone(),
+                    h.minted_approvals.clone(),
+                )
+            });
         let Some((run_id, token, cancel, pending_inputs, pending_approvals, minted_approvals)) =
             target
         else {
@@ -2044,6 +2139,7 @@ async fn drive_run(
     run_id: String,
     harness: Arc<dyn Harness>,
     request: RunRequest,
+    generation: Arc<ChatDocHandle>,
     doc: Arc<SessionDoc>,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -2571,7 +2667,7 @@ async fn drive_run(
                 // which `TitleGenerator::apply_agent_title` writes through —
                 // see that method's own doc.
                 if let Some(titles) = inner.titles.get() {
-                    titles.apply_agent_title(&chat_id, title);
+                    titles.apply_agent_title(generation.clone(), title);
                 }
             }
             _ => {}
@@ -2762,7 +2858,7 @@ async fn drive_run(
             if *status == DoneStatus::Completed
                 && let Some(titles) = inner.titles.get()
             {
-                titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
+                titles.maybe_generate(generation.clone(), harness_id, &user_prompt, &run_cwd);
             }
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for

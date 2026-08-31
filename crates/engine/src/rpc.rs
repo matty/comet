@@ -2105,6 +2105,211 @@ mod tests {
         }
     }
 
+    /// Shared tail for a mock harness's `run`: every prompt other than the
+    /// one under test just parks until interrupted, same as a real run's
+    /// non-title turn would while the test manipulates the title path.
+    fn interrupted_run_stream(
+        controls: comet_harness::RunControls,
+    ) -> futures::stream::BoxStream<
+        'static,
+        Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+    > {
+        Box::pin(futures::stream::once(async move {
+            controls.interrupt.cancelled().await;
+            Ok(comet_proto::AgentEvent::Done {
+                status: comet_proto::DoneStatus::Interrupted,
+                result: None,
+                error: None,
+                session_id: None,
+            })
+        }))
+    }
+
+    /// Holds title-model discovery across deletion so the detached task can
+    /// be resumed after a same-id successor is live.
+    struct DiscoveryPausedTitleHarness {
+        discovery_started: Mutex<Option<oneshot::Sender<()>>>,
+        discovery_release: Mutex<Option<oneshot::Receiver<()>>>,
+        title_dispatched: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for DiscoveryPausedTitleHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Discovery-paused titling"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            let started = self
+                .discovery_started
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one title discovery");
+            let release = self
+                .discovery_release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one paused discovery");
+            let _ = started.send(());
+            let _ = release.await;
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            request: comet_proto::RunRequest,
+            controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            if request.prompt.starts_with("Reply with ONLY a concise") {
+                if let Some(dispatched) = self.title_dispatched.lock().unwrap().take() {
+                    let _ = dispatched.send(());
+                }
+                return Ok(Box::pin(futures::stream::iter([
+                    Ok(comet_proto::AgentEvent::TextDelta {
+                        text: "Stale Discovery Title".into(),
+                    }),
+                    Ok(comet_proto::AgentEvent::Done {
+                        status: comet_proto::DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }),
+                ])));
+            }
+
+            Ok(interrupted_run_stream(controls))
+        }
+    }
+
+    /// Holds the title provider itself across deletion, after discovery and
+    /// dispatch have both completed their generation checks.
+    struct ProviderPausedTitleHarness {
+        title_started: Mutex<Option<oneshot::Sender<()>>>,
+        title_release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for ProviderPausedTitleHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Provider-paused titling"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            request: comet_proto::RunRequest,
+            controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            if request.prompt.starts_with("Reply with ONLY a concise") {
+                let started = self
+                    .title_started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one title provider run");
+                let release = self
+                    .title_release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one paused title provider");
+                let _ = started.send(());
+                let _ = release.await;
+                return Ok(Box::pin(futures::stream::iter([
+                    Ok(comet_proto::AgentEvent::TextDelta {
+                        text: "Stale Provider Title".into(),
+                    }),
+                    Ok(comet_proto::AgentEvent::Done {
+                        status: comet_proto::DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    }),
+                ])));
+            }
+
+            Ok(interrupted_run_stream(controls))
+        }
+    }
+
+    struct CommandRecordingHarness {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl comet_harness::Harness for CommandRecordingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+
+        fn display_name(&self) -> &str {
+            "Command recording"
+        }
+
+        fn capabilities(&self) -> comet_proto::HarnessCapabilities {
+            comet_proto::HarnessCapabilities::default()
+        }
+
+        async fn models(&self) -> Result<comet_proto::ModelCatalog, comet_harness::HarnessError> {
+            Ok(comet_proto::ModelCatalog::built_in(Vec::new()))
+        }
+
+        async fn run(
+            &self,
+            request: comet_proto::RunRequest,
+            _controls: comet_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+            >,
+            comet_harness::HarnessError,
+        > {
+            self.prompts.lock().unwrap().push(request.prompt);
+            Ok(Box::pin(futures::stream::iter([Ok(
+                comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            )])))
+        }
+    }
+
     type RequestLog = Arc<Mutex<Vec<comet_proto::RunRequest>>>;
 
     /// Records the engine-owned resume injected into every harness request and
@@ -2397,6 +2602,39 @@ mod tests {
         registry.register(Arc::new(comet_harness::mock::MockHarness::new()));
         crate::EngineCore::assemble(dir, registry, HarnessId::Mock, None)
             .expect("engine core assembles")
+    }
+
+    fn core_with_harness(
+        dir: &std::path::Path,
+        harness: Arc<dyn comet_harness::Harness>,
+    ) -> crate::EngineCore {
+        let registry = Arc::new(crate::registry::HarnessRegistry::new());
+        registry.register(harness);
+        crate::EngineCore::assemble(dir, registry, HarnessId::Mock, None)
+            .expect("engine core assembles")
+    }
+
+    async fn delete_and_recreate_chat(core: &crate::EngineCore, chat_id: &str, space_id: &str) {
+        let mut purge_done = core.doc_host.watch_purges();
+        core.remote_rpc_service()
+            .mutate(MutateParams::DeleteChat {
+                chat_id: chat_id.to_string(),
+            })
+            .expect("delete old generation");
+        tokio::time::timeout(Duration::from_secs(1), purge_done.changed())
+            .await
+            .expect("old generation purge completes")
+            .expect("purge watch remains connected");
+        core.remote_rpc_service()
+            .mutate(MutateParams::CreateChat {
+                chat_id: chat_id.to_string(),
+                space_id: space_id.to_string(),
+                config: None,
+                branch: None,
+                cwd: None,
+            })
+            .expect("same-id successor is admitted");
+        core.doc_host.open(chat_id).expect("successor handle opens");
     }
 
     async fn init_source_pair_repo(root: &std::path::Path) {
@@ -2757,6 +2995,194 @@ mod tests {
             requests[1].resume, None,
             "the first run in a recreated chat starts fresh"
         );
+    }
+
+    /// Break caught: title discovery returns after its exact document was
+    /// purged, then starts a provider for a same-id successor.
+    #[tokio::test]
+    async fn stale_title_discovery_cannot_dispatch_against_a_recreated_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let (discovery_started, discovery_started_rx) = oneshot::channel();
+        let (discovery_release, discovery_release_rx) = oneshot::channel();
+        let (title_dispatched, title_dispatched_rx) = oneshot::channel();
+        let core = core_with_harness(
+            dir.path(),
+            Arc::new(DiscoveryPausedTitleHarness {
+                discovery_started: Mutex::new(Some(discovery_started)),
+                discovery_release: Mutex::new(Some(discovery_release_rx)),
+                title_dispatched: Mutex::new(Some(title_dispatched)),
+            }),
+        );
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+
+        core.sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                recording_request(dir.path(), "name the old generation"),
+                Some("old-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), discovery_started_rx)
+            .await
+            .expect("title discovery starts")
+            .expect("discovery notification remains connected");
+
+        delete_and_recreate_chat(&core, "chat-1", "space-1").await;
+        discovery_release.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), title_dispatched_rx)
+                .await
+                .is_err(),
+            "stale discovery must be rejected before the title provider starts"
+        );
+        assert_eq!(
+            core.workspace.doc().chat("chat-1").unwrap().unwrap().title,
+            None
+        );
+        core.shutdown().await;
+    }
+
+    /// Break caught: a title provider returns after deletion and writes its
+    /// old prompt's title into the untitled same-id successor.
+    #[tokio::test]
+    async fn stale_title_provider_result_cannot_rename_a_recreated_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let (title_started, title_started_rx) = oneshot::channel();
+        let (title_release, title_release_rx) = oneshot::channel();
+        let core = core_with_harness(
+            dir.path(),
+            Arc::new(ProviderPausedTitleHarness {
+                title_started: Mutex::new(Some(title_started)),
+                title_release: Mutex::new(Some(title_release_rx)),
+            }),
+        );
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+
+        core.sessions
+            .dispatch(
+                "chat-1",
+                HarnessId::Mock,
+                recording_request(dir.path(), "title the old generation"),
+                Some("old-user".into()),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), title_started_rx)
+            .await
+            .expect("title provider starts")
+            .expect("title notification remains connected");
+
+        delete_and_recreate_chat(&core, "chat-1", "space-1").await;
+        title_release.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            core.workspace.doc().chat("chat-1").unwrap().unwrap().title,
+            None,
+            "a title result from the deleted generation must be discarded"
+        );
+        core.shutdown().await;
+    }
+
+    /// Break caught: a drain that passed its one-time host check before
+    /// deletion resumes later and dispatches its old command by chat id into
+    /// the successor's document.
+    #[tokio::test]
+    async fn stale_command_drain_cannot_dispatch_into_a_recreated_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("device-id"), "dev-a").unwrap();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let core = core_with_harness(
+            dir.path(),
+            Arc::new(CommandRecordingHarness {
+                prompts: prompts.clone(),
+            }),
+        );
+        core.workspace
+            .create_space(
+                "space-1",
+                "dev-a",
+                unwatched_space_root(dir.path()).to_string_lossy().as_ref(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat("chat-1", "space-1", None, None)
+            .unwrap();
+        core.doc_host.open("chat-1").unwrap();
+        let (drain_reached, drain_release) =
+            core.doc_host.pause_next_command_drain_for_test("chat-1");
+        core.doc_host
+            .queue_command(
+                "chat-1",
+                SessionCommandPayload::Run {
+                    request: recording_request(dir.path(), "old queued command"),
+                    message_id: "old-command-user".into(),
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), drain_reached)
+            .await
+            .expect("old drain reaches its pause")
+            .expect("drain notification remains connected");
+
+        delete_and_recreate_chat(&core, "chat-1", "space-1").await;
+        drain_release.send(()).unwrap();
+        let stale_dispatch = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if prompts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|prompt| prompt == "old queued command")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            stale_dispatch.is_err(),
+            "an old drain must stop before dispatching against the successor"
+        );
+        assert!(
+            core.doc_host
+                .open("chat-1")
+                .unwrap()
+                .doc()
+                .read_entries()
+                .unwrap()
+                .is_empty(),
+            "the successor document must not receive the old command's user message"
+        );
+        core.shutdown().await;
     }
 
     /// A rejected resume belongs to the document generation that launched it.
