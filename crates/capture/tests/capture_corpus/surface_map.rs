@@ -14,8 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use comet_capture::{
-    Direction, FieldObservation, corpus_root, observe_surface, render_suspected_maps_report,
-    sanitize_dir,
+    Direction, FieldObservation, SanitizationError, corpus_root, observe_surface, sanitize_dir,
 };
 use serde_json::{Value, json};
 
@@ -723,17 +722,14 @@ fn the_promoted_corpus_yields_the_control_protocol_subtypes() {
     );
 }
 
-/// D77's residual, closed as a heuristic warning rather than a hard gate:
-/// `surface::MAP_PATHS` still only rejects a declared map's own keys, so an
-/// object at an *undeclared* path (an MCP server name, an account, a
-/// machine) still publishes its keys verbatim -- this only makes sure a
-/// human reviewing the capture before promotion is told where to look.
+/// D77's residual: an object at an *undeclared* path (an MCP server name, an
+/// account, a machine) must block publication before it can publish its keys
+/// verbatim.
 ///
 /// Break caught: an undeclared object keyed by account ids, with no field
-/// name in sight, must produce a `SuspectedMap` naming the path -- and the
-/// rendered report must name the path without ever printing an actual key.
+/// name in sight, must reject staging without ever printing an actual key.
 #[test]
-fn sanitize_dir_warns_on_an_undeclared_object_keyed_by_account_ids() {
+fn sanitize_dir_rejects_an_undeclared_object_keyed_by_account_ids_without_printing_keys() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -745,33 +741,29 @@ fn sanitize_dir_warns_on_an_undeclared_object_keyed_by_account_ids() {
     );
     let output = staging_dir(temp.path(), "undeclared-account-map");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
-    let warning = report
-        .suspected_maps
-        .iter()
-        .find(|entry| entry.path == ".accounts")
-        .unwrap_or_else(|| {
-            panic!(
-                "no suspected-map warning for .accounts: {:?}",
-                report.suspected_maps
-            )
-        });
-    assert_eq!(warning.key_count, 2);
-    assert_eq!(warning.non_identifier_count, 2);
-
-    let rendered = render_suspected_maps_report(&report.suspected_maps);
-    assert!(rendered.contains(".accounts"), "{rendered}");
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".accounts"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".accounts") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("acct-7f2c9a1d"));
+    assert!(!rendered.contains("acct-04b6e2f9"));
     assert!(
-        !rendered.contains("acct-7f2c9a1d") && !rendered.contains("acct-04b6e2f9"),
-        "an account id must never be printed, even in a warning: {rendered}"
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
     );
 }
 
 /// The false-negative-avoidance half: an object whose keys are ordinary
-/// field names must produce no warning at all.
+/// field names must still stage successfully.
 #[test]
-fn sanitize_dir_does_not_warn_on_an_object_with_ordinary_field_names() {
+fn sanitize_dir_accepts_an_object_with_ordinary_field_names() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -783,24 +775,21 @@ fn sanitize_dir_does_not_warn_on_an_object_with_ordinary_field_names() {
     );
     let output = staging_dir(temp.path(), "ordinary-fields");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
+    sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
     assert!(
-        report.suspected_maps.is_empty(),
-        "ordinary field names must not warn: {:?}",
-        report.suspected_maps
+        output.exists(),
+        "ordinary field objects must remain promotable"
     );
 }
 
 /// The false-positive guard, exercised end to end rather than as a pure-function
 /// unit test: a single vendor-namespaced key sitting beside four ordinary
 /// siblings -- `_meta`'s own real shape, already reviewed field-by-field on
-/// `allowlist/acp.txt` -- must not read as a suspected map. A heuristic that
-/// fired here would repeat on every single ACP sanitize run against an
-/// already-settled decision, which is the "fires on everything" failure this
-/// row explicitly warns against.
+/// `allowlist/acp.txt` -- must still stage successfully. A heuristic that
+/// rejects here would block every ACP sanitize run against an already-settled
+/// decision, which is the "fires on everything" failure this row guards.
 #[test]
-fn sanitize_dir_does_not_warn_when_one_vendor_key_sits_among_ordinary_siblings() {
+fn sanitize_dir_accepts_one_vendor_key_among_ordinary_siblings() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -812,14 +801,9 @@ fn sanitize_dir_does_not_warn_when_one_vendor_key_sits_among_ordinary_siblings()
     );
     let output = staging_dir(temp.path(), "meta-vendor-namespace");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
+    sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
     assert!(
-        !report
-            .suspected_maps
-            .iter()
-            .any(|entry| entry.path == ".result._meta"),
-        "one namespaced field among four plain ones must not warn: {:?}",
-        report.suspected_maps
+        output.exists(),
+        "one vendor key among ordinary siblings must remain promotable"
     );
 }

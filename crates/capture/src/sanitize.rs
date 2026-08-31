@@ -112,6 +112,16 @@ pub enum SanitizationError {
     UnparseableStructuredPayload { sequence: u64 },
     #[error("Claude capture command has invalid resume arguments at {location}")]
     InvalidClaudeResumeCommand { location: String },
+    #[error(
+        "capture has suspected undeclared map at {path}: \
+         {non_identifier_count} of {key_count} keys look data-shaped; \
+         declare it in surface::MAP_PATHS before promotion"
+    )]
+    SuspectedUndeclaredMap {
+        path: String,
+        key_count: usize,
+        non_identifier_count: usize,
+    },
     #[error("sanitized capture could not be written")]
     WriteOutput {
         #[source]
@@ -275,6 +285,13 @@ pub fn sanitize_dir(
     let novel_paths = redactor.novel_paths();
     let escaped_paths = redactor.escaped_paths();
     let suspected_maps = redactor.suspected_maps();
+    if let Some(map) = suspected_maps.into_iter().next() {
+        return Err(SanitizationError::SuspectedUndeclaredMap {
+            path: map.path,
+            key_count: map.key_count,
+            non_identifier_count: map.non_identifier_count,
+        });
+    }
     let mut manifest = json!({
         "schema_version": 1,
         "provider": capture.provider,
@@ -351,7 +368,7 @@ pub fn sanitize_dir(
         manifest_bytes,
         novel_paths,
         escaped_paths,
-        suspected_maps,
+        suspected_maps: redactor.suspected_maps(),
     })
 }
 
