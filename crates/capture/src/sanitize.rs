@@ -748,8 +748,8 @@ impl Redactor {
     /// decision) and its `key` stays the containing field's key, so
     /// `is_secret_field`/`named_kind` still see a meaningful field name for
     /// each scalar inside e.g. `"tags": ["sk-ant-…"]`. `diagnostic_path`
-    /// separately folds data-shaped keys, so a suspected descendant map
-    /// cannot reveal an unreviewed ancestor key.
+    /// separately folds every key not explicitly reviewed as a field, so a
+    /// suspected descendant map cannot reveal an unreviewed ancestor key.
     fn sanitize_value_tree(
         &mut self,
         value: &mut Value,
@@ -818,12 +818,13 @@ impl Redactor {
                     let key_survives = !is_map
                         || surface::is_named_map_child(path, &child_key)
                         || allows_prefix(provider, &candidate_path);
-                    let diagnostic_child_path =
-                        if key_survives && surface::is_identifier_shaped(&child_key) {
-                            format!("{diagnostic_path}.{escaped_key}")
-                        } else {
-                            format!("{diagnostic_path}.{{}}")
-                        };
+                    let diagnostic_key_survives = surface::is_named_map_child(path, &child_key)
+                        || allows_prefix(provider, &candidate_path);
+                    let diagnostic_child_path = if diagnostic_key_survives {
+                        format!("{diagnostic_path}.{escaped_key}")
+                    } else {
+                        format!("{diagnostic_path}.{{}}")
+                    };
                     let (child_key, child_path) = if key_survives {
                         if key_needed_escaping {
                             self.escaped.insert(candidate_path.clone());

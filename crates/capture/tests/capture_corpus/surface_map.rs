@@ -748,10 +748,11 @@ fn sanitize_dir_rejects_an_undeclared_object_keyed_by_account_ids_without_printi
             ref path,
             key_count: 2,
             non_identifier_count: 2,
-        } if path == ".accounts"
+        } if path == ".{}"
     ));
     let rendered = error.to_string();
-    assert!(rendered.contains(".accounts") && rendered.contains("2 of 2"));
+    assert!(rendered.contains(".{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
     assert!(!rendered.contains("acct-7f2c9a1d"));
     assert!(!rendered.contains("acct-04b6e2f9"));
     assert!(
@@ -783,11 +784,46 @@ fn sanitize_dir_rejects_a_nested_map_without_revealing_a_mixed_parent_data_key()
             ref path,
             key_count: 2,
             non_identifier_count: 2,
-        } if path == ".accounts.{}"
+        } if path == ".{}.{}"
     ));
     let rendered = error.to_string();
-    assert!(rendered.contains(".accounts.{}") && rendered.contains("2 of 2"));
+    assert!(rendered.contains(".{}.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
     assert!(!rendered.contains("acct-private-42"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
+/// An identifier-shaped key under an undeclared object is not evidence that
+/// it is a field, so the nested diagnostic must fold it as structural data.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_an_identifier_shaped_account_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-identifier-account-map",
+        &[
+            r#"{"type":"system","subtype":"init","accounts":{"alice":{"model-a":{},"model-b":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-identifier-account-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".{}.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".{}.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
+    assert!(!rendered.contains("alice"));
     assert!(
         !output.exists(),
         "a rejected capture must create no staging artifact"
