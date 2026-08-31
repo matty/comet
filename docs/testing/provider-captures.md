@@ -235,7 +235,7 @@ so an identifier sitting in an object *key* was invisible to it. A rogue key pla
 `.modelUsage` with no scalars beneath it fails the key property while the scalar property, the
 manifest-token property and the capability sheet's golden test all stay green.
 
-**A suspected undeclared map stops sanitization before any staging artifact exists.** The
+**A suspected undeclared map stops sanitization before publishing a new staging artifact.** The
 diagnostic gives only its structurally-redacted path and key counts, never a key or value. Declare
 the path in `surface::MAP_PATHS`, then rerun the sanitizer; do not promote its prior output. An
 exact-path exemption needs a demonstrated false positive and a separate design, not an ad hoc

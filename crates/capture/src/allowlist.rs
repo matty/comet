@@ -20,8 +20,9 @@
 //! that rule (finding 1, PR #66), an object keyed by anything identifying rode
 //! into the archive verbatim while its value was dutifully redacted beside it,
 //! and no test could see it: `allowlist_property.rs` walks scalars, and the
-//! capability sheet collapses a map key to `{}` by design. An undeclared map
-//! now stops sanitization before publication — `docs/debt/closed.md` D77.
+//! capability sheet collapses a map key to `{}` by design. A suspected
+//! undeclared map now stops sanitization before publication —
+//! `docs/debt/closed.md` D77.
 //!
 //! **Standing rule (adopted 2026-08-15): a field nothing decodes defaults to
 //! redacted.** A path no code reads gains nothing from surviving verbatim, so
