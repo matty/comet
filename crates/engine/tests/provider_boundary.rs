@@ -80,6 +80,20 @@ fn codex_request(fixture: &EngineFixture, prompt: &str, mode: RuntimeMode) -> Ru
     }
 }
 
+async fn queue(fixture: &EngineFixture, command: SessionCommandPayload) -> String {
+    fixture
+        .client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({"chatId": CHAT, "command": command}),
+        )
+        .await
+        .expect("queue command through RPC")["commandId"]
+        .as_str()
+        .expect("queued command id")
+        .into()
+}
+
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
@@ -202,21 +216,14 @@ async fn fake_codex_rejected_resume_falls_back_to_a_fresh_durable_session() {
     let fixture = EngineFixture::new();
     let mut request = codex_request(&fixture, "scenario:resumed", RuntimeMode::ApprovalRequired);
     request.resume = Some("resume-fail".into());
-    let queued = fixture
-        .client
-        .call(
-            comet_rpc::methods::QUEUE_COMMAND,
-            serde_json::json!({
-                "chatId": CHAT,
-                "command": SessionCommandPayload::Run {
-                    request,
-                    message_id: "m-resume-fallback".into(),
-                },
-            }),
-        )
-        .await
-        .expect("queue resume command through RPC");
-    let command_id = queued["commandId"].as_str().expect("queued command id");
+    let command_id = queue(
+        &fixture,
+        SessionCommandPayload::Run {
+            request,
+            message_id: "m-resume-fallback".into(),
+        },
+    )
+    .await;
 
     wait_for(
         || {
@@ -286,24 +293,18 @@ async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() 
     let mut materialized = Vec::new();
     apply_message_frame(&mut materialized, reset);
 
-    let queued = fixture
-        .client
-        .call(
-            comet_rpc::methods::QUEUE_COMMAND,
-            serde_json::json!({
-                "chatId": CHAT,
-                "command": SessionCommandPayload::Run {
-                    request: codex_request(&fixture, "scenario:cancel-approval", RuntimeMode::ApprovalRequired),
-                    message_id: "m-cancel-approval".into(),
-                },
-            }),
-        )
-        .await
-        .expect("queue cancellation run through RPC");
-    let run_command_id = queued["commandId"]
-        .as_str()
-        .expect("queued run command id")
-        .to_owned();
+    let run_command_id = queue(
+        &fixture,
+        SessionCommandPayload::Run {
+            request: codex_request(
+                &fixture,
+                "scenario:cancel-approval",
+                RuntimeMode::ApprovalRequired,
+            ),
+            message_id: "m-cancel-approval".into(),
+        },
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let request_id = loop {
@@ -332,26 +333,16 @@ async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() 
         }
     };
 
-    let queued = fixture
-        .client
-        .call(
-            comet_rpc::methods::QUEUE_COMMAND,
-            serde_json::json!({
-                "chatId": CHAT,
-                "command": SessionCommandPayload::RespondApproval {
-                    request_id: request_id.clone(),
-                    decision: ApprovalDecision::DenyAndInterrupt {
-                        message: "stop before touching that file".into(),
-                    },
-                },
-            }),
-        )
-        .await
-        .expect("queue cancellation approval through RPC");
-    let approval_command_id = queued["commandId"]
-        .as_str()
-        .expect("queued approval command id")
-        .to_owned();
+    let approval_command_id = queue(
+        &fixture,
+        SessionCommandPayload::RespondApproval {
+            request_id: request_id.clone(),
+            decision: ApprovalDecision::DenyAndInterrupt {
+                message: "stop before touching that file".into(),
+            },
+        },
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
