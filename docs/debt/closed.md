@@ -4,6 +4,20 @@ Kept for the reasoning, not the status. Each of these merged;
 `README.md` carries the row and the PR. Delete an entry only if its
 explanation stops being useful to someone reading the code it touched.
 
+## D36 — provider default reasoning
+
+Codex's `model/list` reports `defaultReasoningEffort` per model. Comet now
+preserves the recognised value as `Model.defaultReasoning` and uses it only
+when the user has no draft, stored-chat, or sticky reasoning selection. An
+absent or unrecognised value remains unknown and keeps the existing ladder
+heuristic.
+
+This optional field does not bump `PROTOCOL_VERSION`: a new peer reading an
+old model list has no metadata and takes that same heuristic, while an old
+peer ignores the new key and also takes the heuristic. The compatibility
+ruling stays beside `PROTOCOL_VERSION` in `crates/proto/src/remote.rs`, the
+source that owns it.
+
 ## D1 — empty `ReasoningDelta` while parked
 
 **The bug.** `sessions.rs`'s run loop treats the first event after parking as the

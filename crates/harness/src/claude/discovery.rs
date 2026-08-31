@@ -296,6 +296,7 @@ pub(crate) fn discovery_from_reply(
                 .iter()
                 .filter_map(|l| to_level(l))
                 .collect(),
+            default_reasoning: None,
             // Claude publishes no modality field. `None` is "did not say"; see
             // `.agents/rules/optional-wire-fields.md`.
             accepts_images: None,
