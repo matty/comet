@@ -68,7 +68,7 @@ pub fn clamp_terminal_height(height: f32, viewport_h: f32) -> f32 {
 }
 
 /// Reconnect backoff: 500 ms doubling to an 8 s ceiling.
-pub fn backoff_ms(attempt: u32) -> u64 {
+fn backoff_ms(attempt: u32) -> u64 {
     (500u64 << attempt.min(4)).min(8_000)
 }
 
@@ -102,7 +102,7 @@ pub fn slide_offset(ix: usize, from: usize, over: usize) -> f32 {
 }
 
 /// Active index after a reorder commit.
-pub fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
+fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
     if active == from {
         to
     } else if from < active && to >= active {
@@ -119,7 +119,7 @@ fn with_target(params: serde_json::Value, _target: &Option<String>) -> serde_jso
 }
 
 /// Active index after closing `closed` (given the new, shorter length).
-pub fn active_after_close(active: usize, closed: usize, len_after: usize) -> usize {
+fn active_after_close(active: usize, closed: usize, len_after: usize) -> usize {
     let shifted = if closed < active { active - 1 } else { active };
     if len_after == 0 {
         0
@@ -129,7 +129,7 @@ pub fn active_after_close(active: usize, closed: usize, len_after: usize) -> usi
 }
 
 /// The `[process exited N]` trailer, dimmed (§1.10).
-pub fn exit_message(code: i32) -> Vec<u8> {
+fn exit_message(code: i32) -> Vec<u8> {
     format!("\r\n\x1b[90m[process exited {code}]\x1b[0m\r\n").into_bytes()
 }
 

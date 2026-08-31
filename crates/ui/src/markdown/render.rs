@@ -57,7 +57,7 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 /// width; wider ones wrap down to this floor, then the table scrolls.
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
 /// Hairline tone (comet md theme `table.borderColor`: rgba(255,255,255,0.1)).
-pub fn table_hairline() -> Hsla {
+fn table_hairline() -> Hsla {
     crate::theme::hairline(0.10)
 }
 
@@ -339,7 +339,7 @@ pub struct TableColumns {
 
 /// Resolve column geometry from measured per-column max-content widths
 /// (content only — padding is added here, as the source adds `2 * cellPadding`).
-pub fn table_columns(content_widths: &[f32]) -> TableColumns {
+fn table_columns(content_widths: &[f32]) -> TableColumns {
     let naturals: Vec<f32> = content_widths
         .iter()
         .map(|w| w.max(TABLE_MIN_COLUMN_CONTENT) + 2.0 * TABLE_CELL_PADDING)
@@ -502,10 +502,10 @@ pub struct FlatText {
 /// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
 /// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
 /// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
-pub fn inline_code_text(theme: &Theme) -> Hsla {
+fn inline_code_text(theme: &Theme) -> Hsla {
     theme.code_text // violet-300
 }
-pub fn inline_code_wash(theme: &Theme) -> Hsla {
+fn inline_code_wash(theme: &Theme) -> Hsla {
     theme.code_wash // violet-400/12
 }
 /// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
@@ -1183,14 +1183,14 @@ fn render_code_block(
 /// Paint color for a token class — the soft syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
-pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
+fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
     theme.syntax.color(kind)
 }
 
 /// Build the exact-cover `TextRun` list for one code line from its tokens.
 /// Same font everywhere — recoloring can never change layout.
 /// Build paint-only runs from the neutral Tree-sitter contract.
-pub fn runs_for_syntax_line(
+fn runs_for_syntax_line(
     line: &str,
     spans: &[HighlightSpan],
     mono: &gpui::Font,

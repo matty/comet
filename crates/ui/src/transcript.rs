@@ -736,7 +736,7 @@ pub struct Row {
 /// `formatTimestamp` shape (utils.ts: short month, numeric day, hour,
 /// 2-digit minutes, no leading zero on the hour). Pure over an explicit
 /// timezone so tests don't depend on the host's local time.
-pub fn format_timestamp<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
+fn format_timestamp<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -931,7 +931,7 @@ fn deny_note_text(decision: Option<&comet_proto::ApprovalDecision>) -> Option<Sh
     }
 }
 
-pub fn rows_for_entry(
+fn rows_for_entry(
     entry: &SessionMessageEntry,
     pending: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
@@ -1412,7 +1412,7 @@ pub enum ParseOutcome {
 /// O(tail) append path for the prefix-extensions the doc watch delivers);
 /// completed parts hit the settled cache, adopt the live parser's tree on the
 /// live→complete flip (flicker-free handoff), or do one full parse.
-pub fn parse_for_row(
+fn parse_for_row(
     streaming: bool,
     key: &str,
     text: &str,
@@ -1462,7 +1462,7 @@ fn part_prefix(id: &str) -> &str {
 /// the markdown block gap between sibling block rows split from the same text
 /// part — matching the live row's internal spacing exactly, so the
 /// live→split handoff cannot shift a pixel; the block gap otherwise.
-pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
+fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     if row.turn_start {
         return GAP_TURN;
     }
@@ -1479,7 +1479,7 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
 
 /// Minimal splice for a row-set change: `Some((old_range, new_count))`, or
 /// `None` when the sets are identical by (id, version).
-pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
+fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
     let eq = |a: &Row, b: &Row| a.id == b.id && a.version == b.version;
     let mut prefix = 0usize;
     let max_prefix = old.len().min(new.len());
@@ -1518,7 +1518,7 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
 pub use comet_proto::view::{single_line, tool_chip_content};
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
-pub fn chips_height(count: usize) -> f32 {
+fn chips_height(count: usize) -> f32 {
     if count == 0 {
         return 0.0;
     }

@@ -95,7 +95,7 @@ pub const RESIZE_SETTLE_MS: u64 = 150;
 /// - a too-narrow pill (`capacity < MIN_COMPACT_INPUT_WIDTH`) always expands;
 /// - compact expands only when `text_width > capacity`; expanded collapses
 ///   only when `text_width < capacity - COLLAPSE_HYSTERESIS`.
-pub fn composer_flip(
+fn composer_flip(
     expanded: bool,
     text_width: f32,
     capacity: f32,
@@ -121,7 +121,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// Caret blink phase for a time since the last keystroke/caret move: solid
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
-pub fn caret_visible(ms_since_activity: u64) -> bool {
+fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
 }
 
@@ -134,7 +134,7 @@ pub fn input_content_height(wrapped_lines: usize) -> f32 {
 /// textarea BOX (content + `pt-4 pb-1`) clamps to [`TEXTAREA_MIN`]–260 like
 /// the original's auto-grow effect, then the 46px actions row and the
 /// hairline ride on top. Range 136.25–308.
-pub fn composer_total_height(content_height: f32) -> f32 {
+fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
         + ACTIONS_ROW_HEIGHT
         + PILL_BORDER_V
@@ -232,7 +232,7 @@ pub const STRIP_PAD_X: f32 = 16.0;
 /// Height the wrap strip adds to the pill for `count` staged thumbnails at an
 /// `inner_width` pill content width (0 when empty). Mirrors flex-wrap: as many
 /// 56px thumbs per row as fit with 8px gaps inside the 16px side insets.
-pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
+fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     if count == 0 {
         return 0.0;
     }
@@ -242,7 +242,7 @@ pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
 }
 
-pub fn comment_strip_height(count: usize) -> f32 {
+fn comment_strip_height(count: usize) -> f32 {
     if count == 0 {
         return 0.0;
     }
@@ -323,7 +323,7 @@ pub const CLUSTER_X_DELTA: f32 = 4.0;
 /// The right inset for the in-flight morph: eases from the OLD mode's resting
 /// inset to the committed mode's (compact 8 ↔ expanded 12) — pairwise button
 /// distances stay constant; the cluster glides as one.
-pub fn morph_cluster_inset(expanded: bool, progress: f32) -> f32 {
+fn morph_cluster_inset(expanded: bool, progress: f32) -> f32 {
     let (from, to) = if expanded {
         (8.0, 8.0 + CLUSTER_X_DELTA)
     } else {
@@ -335,7 +335,7 @@ pub fn morph_cluster_inset(expanded: bool, progress: f32) -> f32 {
 /// Expanded text top padding across the morph: starts at the compact resting
 /// inset (12 ≈ `py-3`) and eases to `pt-4` (16) — the first line glides with
 /// the rising top edge instead of jumping at the commit.
-pub fn morph_text_pad(progress: f32) -> f32 {
+fn morph_text_pad(progress: f32) -> f32 {
     motion::lerp(12.0, 16.0, progress)
 }
 
@@ -344,7 +344,7 @@ pub fn morph_text_pad(progress: f32) -> f32 {
 /// 12 centering inset), while at the commit instant the text sat 17px below
 /// the expanded pill's top (1 hairline + 16 `pt-4`) — i.e. `from − 17` above
 /// the bottom. The decaying relative offset walks it down smoothly.
-pub fn collapse_text_glide(from: f32, progress: f32) -> f32 {
+fn collapse_text_glide(from: f32, progress: f32) -> f32 {
     (from - 53.0).max(0.0) * (1.0 - progress)
 }
 
@@ -353,7 +353,7 @@ pub fn collapse_text_glide(from: f32, progress: f32) -> f32 {
 /// bottom anchor at FULL alpha throughout (round-9 follow-up: any fade on the
 /// picker chips read as flicker; their screen position is near-stationary
 /// across the flip, so nothing needs to be hidden).
-pub fn morph_cluster_dy(progress: f32) -> f32 {
+fn morph_cluster_dy(progress: f32) -> f32 {
     CLUSTER_Y_DELTA * (1.0 - progress)
 }
 
@@ -375,7 +375,7 @@ pub const ROUTE_SNAP_MS: u64 = 250;
 /// Reduced motion (or a first paint with no measured height yet) snaps, and
 /// `route_snap` (a session/route change within [`ROUTE_SNAP_MS`]) both blocks
 /// arming AND kills anything in flight — navigation never animates the pill.
-pub fn flip_morph_step(
+fn flip_morph_step(
     morph: Option<FlipMorph>,
     mode_changed: bool,
     last_height: f32,
@@ -412,11 +412,11 @@ pub enum SendButtonMode {
 /// What the composer holds that a send could carry. A staged image or diff
 /// comment counts: both synthesize their own prompt body, so either alone is
 /// a legal send — and during a live run has to read as Steer, not Stop.
-pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
+fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
-pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
+fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Steer,
@@ -424,7 +424,7 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
-pub fn assemble_user_message(
+fn assemble_user_message(
     text: &str,
     comments: &[crate::comments::DiffComment],
     attachment_paths: &[String],
@@ -442,7 +442,7 @@ pub struct CommentSendSnapshot {
     pub comments: Vec<crate::comments::DiffComment>,
 }
 
-pub fn take_comment_snapshot(
+fn take_comment_snapshot(
     state: &mut AppState,
     owner: &ServerRef,
     typed: &str,
@@ -454,7 +454,7 @@ pub fn take_comment_snapshot(
     }
 }
 
-pub fn restore_comment_snapshot(state: &mut AppState, snapshot: &CommentSendSnapshot) {
+fn restore_comment_snapshot(state: &mut AppState, snapshot: &CommentSendSnapshot) {
     state.restore_diff_comments(&snapshot.owner, snapshot.comments.clone());
 }
 
@@ -507,7 +507,7 @@ pub fn pending_input_request(
 /// stays in the chat — but only some providers put it on the wire. Codex's
 /// decisions are bare literals with no message field, so a field labelled "for
 /// the agent" there promises a delivery that never happens (`docs/debt/README.md` D24).
-pub fn deny_note_placeholder(carries_deny_note: bool) -> &'static str {
+fn deny_note_placeholder(carries_deny_note: bool) -> &'static str {
     if carries_deny_note {
         "Add a note for the agent (optional)"
     } else {
@@ -568,7 +568,7 @@ fn approval_shows_session_action(approval: &comet_proto::ApprovalRequest) -> boo
 
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
 /// another device) — the wizard latch's release condition.
-pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
+fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
     transcript.iter().any(|entry| {
         entry.parts.iter().any(|part| {
             matches!(

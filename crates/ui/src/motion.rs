@@ -545,7 +545,7 @@ thread_local! {
 }
 
 /// Hover progress (0..1) for `key` this frame.
-pub fn hover_t(key: &str) -> f32 {
+fn hover_t(key: &str) -> f32 {
     HOVER_FADES.with(|fades| fades.borrow_mut().value_at(key, Instant::now()))
 }
 

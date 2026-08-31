@@ -516,7 +516,7 @@ impl fmt::Debug for RemoteSettingsState {
     }
 }
 
-pub fn remote_status_label(status: &RemoteConnectionState) -> String {
+fn remote_status_label(status: &RemoteConnectionState) -> String {
     match status {
         RemoteConnectionState::Connecting => "Connecting".into(),
         RemoteConnectionState::Online => "Online".into(),
@@ -531,7 +531,7 @@ pub fn remote_status_label(status: &RemoteConnectionState) -> String {
     }
 }
 
-pub fn listener_status_label(status: &ListenerStatus) -> String {
+fn listener_status_label(status: &ListenerStatus) -> String {
     match status {
         ListenerStatus::Disabled => "Not listening".into(),
         ListenerStatus::Listening { bind } => format!("Listening on {bind}"),

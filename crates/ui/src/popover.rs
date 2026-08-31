@@ -80,7 +80,7 @@ pub fn menu_step(active: Option<usize>, count: usize, delta: isize) -> Option<us
 /// Match rank of a label against a query: `0` prefix match, `1` substring,
 /// `None` no match. Case-insensitive; an empty query matches everything at
 /// rank 1 (input order preserved).
-pub fn match_rank(query: &str, label: &str) -> Option<usize> {
+fn match_rank(query: &str, label: &str) -> Option<usize> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Some(1);
@@ -483,7 +483,7 @@ pub fn band() -> gpui::Hsla {
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
 /// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
 /// chips ("⌘K", "esc").
-pub fn key_cap(_theme: &Theme) -> gpui::Div {
+fn key_cap(_theme: &Theme) -> gpui::Div {
     div()
         .h(px(22.0))
         .px(px(5.0))

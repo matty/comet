@@ -67,7 +67,7 @@ pub const HERMES_ARGS: [&str; 1] = ["acp"];
 /// (`...\Python314\Scripts\hermes.exe`), so PATH is what actually answers
 /// here -- confirming PATH has to stay the first place looked, not an
 /// optimization to drop in favor of the fixed install dirs below.
-pub fn resolve_hermes_executable() -> Option<PathBuf> {
+fn resolve_hermes_executable() -> Option<PathBuf> {
     crate::resolve_cli(
         "HERMES_EXECUTABLE",
         "hermes",

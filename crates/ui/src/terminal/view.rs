@@ -47,7 +47,7 @@ pub const RESIZE_DEBOUNCE_MS: u64 = 80;
 /// *down* to `#fafafa`. The step is bigger than dark's 3/255 for the reason the
 /// theme's light surfaces are (`Theme::light`): a near-white delta that reads
 /// as separation on near-black disappears entirely on white.
-pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
+fn terminal_bg_for(appearance: Appearance) -> Hsla {
     match appearance {
         Appearance::Dark => rgb8(0x09, 0x09, 0x09),
         Appearance::Light => rgb8(0xfa, 0xfa, 0xfa),
@@ -73,7 +73,7 @@ pub fn terminal_bg() -> Hsla {
 /// takes. The alpha is heavier than a hover wash because this has to read as a
 /// deliberate highlight at a glance, and lighter than a plate because the
 /// glyphs underneath still have to be legible through it.
-pub fn terminal_selection_for(appearance: Appearance) -> Hsla {
+fn terminal_selection_for(appearance: Appearance) -> Hsla {
     match appearance {
         Appearance::Dark => gpui::hsla(0.0, 0.0, 1.0, 0.22),
         // Slightly heavier: an equal alpha of black on near-white reads fainter
@@ -158,7 +158,7 @@ const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 ///   stays the faintest and 255 the strongest in both. Without this the ramp is
 ///   the single biggest legibility hole on white, because its bright end —
 ///   where most "dim hint" text lands — is the end that vanishes.
-pub fn indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
+fn indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
     match index {
         0..=15 => match appearance {
             Appearance::Dark => ANSI16_DARK[index as usize],
@@ -185,7 +185,7 @@ pub fn indexed_rgb(appearance: Appearance, index: u8) -> (u8, u8, u8) {
 }
 
 /// Resolve a cell color to paint against the theme.
-pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
+fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
     match color {
         CellColor::Foreground => theme.text,
         CellColor::Background => terminal_bg_for(theme.appearance),

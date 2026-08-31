@@ -156,7 +156,7 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
 /// A model's default reasoning: X-High when the ladder offers it (comet
 /// `DEFAULT_REASONING = "xhigh"`), else High, else the ladder's first entry.
 /// `None` only for ladder-less models (e.g. Haiku's thinking toggle instead).
-pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
+fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
     // The recommended default is High (user-corrected — not X-High globally);
     // fall to Medium then the ladder's first entry for shorter ladders.
     if ladder.contains(&ReasoningLevel::High) {
@@ -171,7 +171,7 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
 /// Clamp a picked/remembered level to what the model actually offers: keep it
 /// when the ladder lists it, else fall to the model's default (never a stale
 /// or foreign level — comet use-run-config.ts's derived-model discipline).
-pub fn clamp_reasoning(
+fn clamp_reasoning(
     level: Option<ReasoningLevel>,
     ladder: &[ReasoningLevel],
 ) -> Option<ReasoningLevel> {
@@ -365,7 +365,7 @@ fn apply_owned_fields(
 // Pure: labels + traits summary
 // ---------------------------------------------------------------------------
 
-pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
+fn reasoning_label(level: ReasoningLevel) -> &'static str {
     match level {
         ReasoningLevel::Minimal => "Minimal",
         ReasoningLevel::Low => "Low",
@@ -382,7 +382,7 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
 /// Chip labels for the permission axis. User vocabulary, not the wire's: the
 /// menu says what the agent will do, never which policy string the provider is
 /// sent.
-pub fn runtime_mode_label(mode: RuntimeMode) -> &'static str {
+fn runtime_mode_label(mode: RuntimeMode) -> &'static str {
     match mode {
         RuntimeMode::ApprovalRequired => "Ask first",
         RuntimeMode::AutoAcceptEdits => "Auto-accept edits",
@@ -394,7 +394,7 @@ pub fn runtime_mode_label(mode: RuntimeMode) -> &'static str {
 /// The one line under the chip row, describing the mode that is active.
 /// `FullAccess` is the only one that names a removal, because it is the only
 /// mode with no sandbox left behind it.
-pub fn runtime_mode_caption(mode: RuntimeMode) -> &'static str {
+fn runtime_mode_caption(mode: RuntimeMode) -> &'static str {
     match mode {
         RuntimeMode::ApprovalRequired => "Every file change and command waits for you.",
         RuntimeMode::AutoAcceptEdits => {
