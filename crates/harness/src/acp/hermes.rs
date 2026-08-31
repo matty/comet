@@ -148,6 +148,7 @@ fn static_models() -> Vec<Model> {
         id: "openai:gpt-5.4-mini".into(),
         label: "GPT-5.4 Mini".into(),
         description: Some("OpenAI's compact model, routed through Hermes".into()),
+        deprecation: None,
         reasoning_levels: Vec::new(),
         options: Vec::new(),
         accepts_images: true,
@@ -202,6 +203,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                 Some(DiscoveredModel {
                     label,
                     description: m["description"].as_str().map(str::to_owned),
+                    deprecation: None,
                     // Hermes offers no effort ladder anywhere in its ACP
                     // surface -- see `HermesHarness::capabilities()`.
                     reasoning_levels: Vec::new(),

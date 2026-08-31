@@ -19,6 +19,7 @@ use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, PathBuilder,
     SharedString, Subscription, Task, Window, canvas, div, point, prelude::*, px,
 };
+use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
@@ -200,6 +201,64 @@ fn caption_for(source: CatalogSource, harness: HarnessId) -> Option<&'static str
         CatalogSource::Live => None,
         CatalogSource::BuiltIn => Some(built_in_caption(harness)),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelUpgradeAction {
+    model_id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelDeprecationGuidance {
+    message: String,
+    action: Option<ModelUpgradeAction>,
+}
+
+fn compact_migration_markdown(markdown: &str) -> String {
+    let mut text = String::new();
+    for event in MarkdownParser::new(markdown) {
+        match event {
+            MarkdownEvent::Text(value) | MarkdownEvent::Code(value) => {
+                text.push_str(&value);
+                text.push(' ');
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => text.push(' '),
+            _ => {}
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Picker-ready retirement guidance. Provider markdown is deliberately not
+/// handed to the transcript renderer: this compact secondary line cannot grow
+/// a catalog row into an unbounded document, while preserving the provider's
+/// wording. The action exists only when the replacement is another selectable
+/// row in this same catalog.
+fn model_deprecation_guidance(
+    model: &Model,
+    catalog: &[Model],
+) -> Option<ModelDeprecationGuidance> {
+    let deprecation = model.deprecation.as_ref()?;
+    let message = deprecation
+        .migration_markdown
+        .as_deref()
+        .map(compact_migration_markdown)
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "This model is being retired.".to_string());
+    let action = deprecation
+        .replacement
+        .as_deref()
+        .and_then(|replacement_id| {
+            catalog
+                .iter()
+                .find(|candidate| candidate.id == replacement_id && candidate.id != model.id)
+                .map(|replacement| ModelUpgradeAction {
+                    model_id: replacement.id.clone(),
+                    label: format!("Use {}", replacement.label),
+                })
+        });
+    Some(ModelDeprecationGuidance { message, action })
 }
 
 /// Whether images may be attached for `model`.
@@ -2956,13 +3015,22 @@ impl Pickers {
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
                 let models = catalog.models.clone();
+                let guidance: Vec<Option<ModelDeprecationGuidance>> = models
+                    .iter()
+                    .map(|model| model_deprecation_guidance(model, &models))
+                    .collect();
                 models
                     .into_iter()
+                    .zip(guidance)
                     .enumerate()
-                    .map(|(ix, model)| {
+                    .map(|(ix, (model, guidance))| {
                         let label: SharedString = model.label.clone().into();
                         let description: Option<SharedString> =
                             model.description.clone().map(Into::into);
+                        let warning: Option<SharedString> = guidance
+                            .as_ref()
+                            .map(|guidance| guidance.message.clone().into());
+                        let upgrade_action = guidance.and_then(|guidance| guidance.action);
                         let id = model.id.clone();
                         let is_selected = selected.as_deref() == Some(model.id.as_str())
                             || (selected.is_none() && ix == 0);
@@ -2997,8 +3065,47 @@ impl Pickers {
                                             .text_color(theme.text_muted.opacity(0.7))
                                             .child(description),
                                     )
+                                })
+                                .when_some(warning, |el, warning| {
+                                    el.child(
+                                        div()
+                                            .w_full()
+                                            .truncate()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.warning_muted)
+                                            .child(warning),
+                                    )
                                 }),
                         )
+                        .when_some(upgrade_action, |el, action| {
+                            let replacement = action.model_id;
+                            el.child(
+                                // A secondary action inside the existing model
+                                // row: no automatic migration and no surface
+                                // outside the picker. Stop the parent row click
+                                // so this selects the replacement, not the
+                                // deprecated row underneath it.
+                                div()
+                                    .id(("model-upgrade", ix))
+                                    .flex_none()
+                                    .max_w(px(120.0))
+                                    .truncate()
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(5.0))
+                                    .bg(crate::theme::ink(0.05))
+                                    .border_1()
+                                    .border_color(crate::theme::hairline(0.08))
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.pick_model(replacement.clone(), cx);
+                                    }))
+                                    .child(SharedString::from(action.label)),
+                            )
+                        })
                         .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                         .into_any_element()
                     })
@@ -4055,6 +4162,7 @@ const SKELETON_PERMISSIONS_W: f32 = 128.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comet_proto::ModelDeprecation;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, SandboxLevel};
 
     /// Every harness must name an icon the asset source can actually serve —
@@ -4282,6 +4390,7 @@ mod tests {
             id: "opus".into(),
             label: "Opus".into(),
             description: None,
+            deprecation: None,
             reasoning_levels: vec![ReasoningLevel::Medium, ReasoningLevel::High],
             options: vec![
                 ModelOption {
@@ -4549,6 +4658,7 @@ mod tests {
             id: "spark".into(),
             label: "Spark".into(),
             description: None,
+            deprecation: None,
             reasoning_levels: vec![],
             options: vec![],
             accepts_images: true,
@@ -4569,6 +4679,7 @@ mod tests {
                 id: "flagship".into(),
                 label: "Flagship".into(),
                 description: None,
+                deprecation: None,
                 reasoning_levels: vec![],
                 options: vec![],
                 accepts_images: true,
@@ -4577,6 +4688,7 @@ mod tests {
                 id: "fast".into(),
                 label: "Fast".into(),
                 description: None,
+                deprecation: None,
                 reasoning_levels: vec![],
                 options: vec![],
                 accepts_images: true,
@@ -5049,6 +5161,89 @@ mod tests {
         assert!(caption_for(CatalogSource::BuiltIn, HarnessId::ClaudeCode).is_some());
     }
 
+    /// Break caught: surfacing the provider markdown without resolving its
+    /// replacement leaves a warning the user cannot act on from the picker.
+    #[test]
+    fn deprecation_guidance_compacts_copy_and_resolves_a_picker_action() {
+        let old = Model {
+            id: "old".into(),
+            label: "Old".into(),
+            description: None,
+            deprecation: Some(ModelDeprecation {
+                replacement: Some("new".into()),
+                migration_markdown: Some(
+                    "Old retires soon.\n\n  Switch to **New** to continue.".into(),
+                ),
+            }),
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+        let new = Model {
+            id: "new".into(),
+            label: "New".into(),
+            description: None,
+            deprecation: None,
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+
+        let guidance = model_deprecation_guidance(&old, &[old.clone(), new]).expect("guidance");
+        assert_eq!(
+            guidance.message,
+            "Old retires soon. Switch to New to continue."
+        );
+        let action = guidance.action.expect("replacement is a catalog row");
+        assert_eq!(action.model_id, "new");
+        assert_eq!(action.label, "Use New");
+    }
+
+    /// A provider can name a replacement omitted from this page/catalog. Keep
+    /// its warning, but do not manufacture a selection for a row that does not
+    /// exist.
+    #[test]
+    fn deprecation_guidance_has_no_action_for_an_unknown_replacement() {
+        let old = Model {
+            id: "old".into(),
+            label: "Old".into(),
+            description: None,
+            deprecation: Some(ModelDeprecation {
+                replacement: Some("missing".into()),
+                migration_markdown: None,
+            }),
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+
+        let guidance = model_deprecation_guidance(&old, std::slice::from_ref(&old))
+            .expect("the advisory still displays");
+        assert_eq!(guidance.message, "This model is being retired.");
+        assert_eq!(guidance.action, None);
+    }
+
+    #[test]
+    fn deprecation_guidance_keeps_copy_without_a_replacement() {
+        let old = Model {
+            id: "old".into(),
+            label: "Old".into(),
+            description: None,
+            deprecation: Some(ModelDeprecation {
+                replacement: None,
+                migration_markdown: Some("Old retires soon.".into()),
+            }),
+            reasoning_levels: vec![],
+            options: vec![],
+            accepts_images: true,
+        };
+
+        let guidance = model_deprecation_guidance(&old, std::slice::from_ref(&old))
+            .expect("guidance survives without an action");
+        assert_eq!(guidance.message, "Old retires soon.");
+        assert_eq!(guidance.action, None);
+    }
+
     /// The decode is pinned against the reply's REAL JSON, not against a
     /// `ModelCatalog` this test built and re-serialized. Task 4 changed the
     /// wire shape and every one of `comet-ui`'s 501 tests stayed green while
@@ -5062,7 +5257,11 @@ mod tests {
                 "id": "claude-sonnet-5",
                 "label": "Sonnet 5",
                 "reasoningLevels": [],
-                "options": []
+                "options": [],
+                "deprecation": {
+                    "replacement": "claude-sonnet-6",
+                    "migrationMarkdown": "Sonnet 5 retires soon. Switch to Sonnet 6."
+                }
             }],
             "source": "builtIn"
         });
@@ -5073,6 +5272,15 @@ mod tests {
         assert!(
             catalog.models[0].accepts_images,
             "absent acceptsImages means images work"
+        );
+        let advice = catalog.models[0]
+            .deprecation
+            .as_ref()
+            .expect("additive advisory metadata decodes at the RPC call site");
+        assert_eq!(advice.replacement.as_deref(), Some("claude-sonnet-6"));
+        assert_eq!(
+            advice.migration_markdown.as_deref(),
+            Some("Sonnet 5 retires soon. Switch to Sonnet 6.")
         );
     }
 }

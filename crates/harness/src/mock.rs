@@ -64,6 +64,7 @@ impl MockHarness {
                 id: "mock-1".into(),
                 label: "Mock 1".into(),
                 description: None,
+                deprecation: None,
                 reasoning_levels: vec![ReasoningLevel::Medium],
                 options: vec![],
                 accepts_images: true,
@@ -74,6 +75,7 @@ impl MockHarness {
                 id: "mock-fable-5".into(),
                 label: "Fable 5".into(),
                 description: None,
+                deprecation: None,
                 reasoning_levels: vec![
                     ReasoningLevel::Low,
                     ReasoningLevel::Medium,

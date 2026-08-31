@@ -178,6 +178,7 @@ fn static_models() -> Vec<Model> {
         id: "grok-4.6".into(),
         label: "Grok 4.6".into(),
         description: Some("SpaceXAI's latest frontier model".into()),
+        deprecation: None,
         reasoning_levels: REASONING_LEVELS.to_vec(),
         options: Vec::new(),
         // Grok's `promptCapabilities.image` reads false on this build, and
@@ -282,6 +283,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                 .unwrap_or(&id)
                 .to_owned(),
             description: extra.and_then(|m| m["description"].as_str().map(str::to_owned)),
+            deprecation: None,
             // The per-model list wins where it exists: a ladder declared on the
             // model is more specific than the session-wide one. Falling back to
             // the session ladder keeps an agent that only declares it once.

@@ -158,6 +158,7 @@ fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) ->
         id: id.into(),
         label: label.into(),
         description: (!description.is_empty()).then(|| description.into()),
+        deprecation: None,
         reasoning_levels: ladder.to_vec(),
         options: vec![service_tier()],
         accepts_images: true,

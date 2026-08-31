@@ -530,6 +530,10 @@ pub(crate) fn approval_unanswered_message() -> String {
 pub(crate) const NOTICE_SUMMARY_MAX: usize = 160;
 /// Byte budget for a notice `detail` built from provider prose.
 pub(crate) const NOTICE_DETAIL_MAX: usize = 480;
+/// Byte budget for catalog migration markdown supplied by a provider. It is
+/// the same class of bounded advisory prose as a notice detail, but remains
+/// catalog metadata rather than becoming a transcript notice.
+pub(crate) const MODEL_MIGRATION_MARKDOWN_MAX: usize = NOTICE_DETAIL_MAX;
 /// Byte budget for a subagent's `prompt`, capped where it enters the doc
 /// (`AgentEvent::SubagentStarted`) — never at its full, unbounded length.
 /// The prompt is the same class of data `doc::parts::sanitize_tool_call`

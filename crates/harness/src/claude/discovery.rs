@@ -290,6 +290,7 @@ pub(crate) fn discovery_from_reply(
             id,
             label: model.display_name.unwrap_or_else(|| model.value.clone()),
             description: model.description,
+            deprecation: None,
             reasoning_levels: model
                 .supported_effort_levels
                 .iter()

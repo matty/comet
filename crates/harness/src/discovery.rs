@@ -11,7 +11,7 @@
 //!    and never mentions `ultracode`/`ultrathink`/`ultra`, and neither provider
 //!    reports Comet's option sets (context window, fast mode) at all.
 
-use comet_proto::{AgentCommand, Model, ModelCatalog, ReasoningLevel};
+use comet_proto::{AgentCommand, Model, ModelCatalog, ModelDeprecation, ReasoningLevel};
 
 /// One model as a provider described it. Deliberately narrower than
 /// [`Model`]: it holds only what a provider can actually tell us, so an
@@ -21,6 +21,9 @@ pub struct DiscoveredModel {
     pub id: String,
     pub label: String,
     pub description: Option<String>,
+    /// Retirement advice reported by the provider. `None` means the provider
+    /// said nothing, not that the model is known to be permanent.
+    pub deprecation: Option<ModelDeprecation>,
     /// Efforts the provider reported. Only consulted for a model with no
     /// curated entry.
     pub reasoning_levels: Vec<ReasoningLevel>,
@@ -99,10 +102,11 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
     let mut merged: Vec<Model> = curated
         .into_iter()
         .map(|mut model| {
-            if let Some(live) = discovery.models.iter().find(|d| d.id == model.id)
-                && let Some(accepts) = live.accepts_images
-            {
-                model.accepts_images = accepts;
+            if let Some(live) = discovery.models.iter().find(|d| d.id == model.id) {
+                if let Some(accepts) = live.accepts_images {
+                    model.accepts_images = accepts;
+                }
+                model.deprecation = live.deprecation.clone();
             }
             model
         })
@@ -116,6 +120,7 @@ pub fn merge(curated: Vec<Model>, discovery: &Discovery) -> Vec<Model> {
             id: live.id.clone(),
             label: live.label.clone(),
             description: live.description.clone(),
+            deprecation: live.deprecation.clone(),
             reasoning_levels: live
                 .reasoning_levels
                 .iter()
@@ -306,6 +311,7 @@ mod tests {
             id: id.into(),
             label: label.into(),
             description: Some("curated".into()),
+            deprecation: None,
             reasoning_levels: levels.to_vec(),
             options: vec![ModelOption {
                 id: "contextWindow".into(),
@@ -325,6 +331,7 @@ mod tests {
             id: id.into(),
             label: label.into(),
             description: Some("live".into()),
+            deprecation: None,
             reasoning_levels: vec![ReasoningLevel::Low, ReasoningLevel::High],
             accepts_images: None,
         }
@@ -353,6 +360,29 @@ mod tests {
             vec![ReasoningLevel::Ultrathink, ReasoningLevel::Max]
         );
         assert_eq!(merged[0].options.len(), 1, "curated options survive");
+    }
+
+    /// Live retirement metadata is advisory state, not a capability. A
+    /// matched curated row must receive it or the common union path drops the
+    /// warning for exactly the models Comet already knows about.
+    #[test]
+    fn matched_id_receives_live_deprecation_guidance() {
+        let mut live = discovered("m-1", "Live Label");
+        live.deprecation = Some(ModelDeprecation {
+            replacement: Some("m-2".into()),
+            migration_markdown: Some("Move soon".into()),
+        });
+        let merged = merge(
+            vec![curated("m-1", "Curated", &[ReasoningLevel::High])],
+            &Discovery { models: vec![live] },
+        );
+        assert_eq!(
+            merged[0]
+                .deprecation
+                .as_ref()
+                .and_then(|d| d.replacement.as_deref()),
+            Some("m-2")
+        );
     }
 
     /// The point of the phase: a model shipped after this build appears
@@ -719,6 +749,7 @@ mod tests {
                 id: "gpt-5.7-nova".into(),
                 label: "Nova".into(),
                 description: None,
+                deprecation: None,
                 reasoning_levels: vec![
                     ReasoningLevel::High,
                     ReasoningLevel::Ultra,
