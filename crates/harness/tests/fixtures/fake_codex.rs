@@ -370,10 +370,12 @@ fn main() {
         simple_completed(&tid);
     } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
-    // NOTE: steer-race before steer — the first match wins, and "scenario:steer"
-    // is a prefix of "scenario:steer-race".
+    // NOTE: steer-race-orphan before steer-race before steer — each is a prefix
+    // of the next broader scenario marker.
+    } else if turn_line.contains("scenario:steer-race-orphan") {
+        steer_race(&mut stdin, &tid, true);
     } else if turn_line.contains("scenario:steer-race") {
-        steer_race(&mut stdin, &tid);
+        steer_race(&mut stdin, &tid, false);
     } else if turn_line.contains("scenario:steer")
         // The real capture-recorder prompt (`record/scenarios/codex.rs`'s
         // `steer_request`), additive alongside the `scenario:steer` test
@@ -587,7 +589,7 @@ fn auto_reviewer(thread_line: &str, tid: &str) {
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 
-fn steer_race(stdin: &mut StdinLock<'_>, tid: &str) {
+fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, orphan_after_completion: bool) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
@@ -606,6 +608,12 @@ fn steer_race(stdin: &mut StdinLock<'_>, tid: &str) {
         r#"{{"id":{sid},"error":{{"code":-32602,"message":"turn already completed"}}}}"#
     ));
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    if orphan_after_completion {
+        // This old-turn frame is already queued before the follow-up starts.
+        emit(
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#,
+        );
+    }
     // The harness must fall back to a follow-up turn/start carrying the text.
     let follow_line = read_line(stdin);
     let fid = rid(&follow_line);

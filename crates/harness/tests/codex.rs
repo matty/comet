@@ -780,6 +780,39 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     }));
 }
 
+/// The rejected-steer response resolves outside the ordered notification
+/// queue. A late old-turn delta therefore must be dropped before `Steered`
+/// opens the fallback assistant entry.
+#[tokio::test]
+async fn rejected_steer_drops_an_orphan_queued_before_the_follow_up() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-race-orphan"), controls).await;
+
+    let steered_pos = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }))
+        .expect("fallback Steered event: {events:?}");
+    let post_steer_deltas: Vec<_> = events[steered_pos + 1..]
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        post_steer_deltas,
+        vec!["fallback"],
+        "only follow-up content may enter the assistant entry after Steered: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn approvals_reach_the_approval_bridge_not_the_input_bridge() {
     // Approvals must reach the ENGINE's approval bridge (`request_approval`).
