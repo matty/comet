@@ -559,6 +559,13 @@ fn approval_denial_actions(supports_approval_interrupt: bool) -> &'static [Appro
     }
 }
 
+/// A session action is omitted when the request would be allowed only once.
+/// Showing the control in that state silently over-promises what the engine
+/// can remember.
+fn approval_shows_session_action(approval: &comet_proto::ApprovalRequest) -> bool {
+    approval.can_grant_for_session()
+}
+
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
 /// another device) — the wizard latch's release condition.
 pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
@@ -5802,6 +5809,7 @@ impl Composer {
             note.clone()
         };
         let supports_approval_interrupt = self.pickers.read(cx).supports_approval_interrupt(cx);
+        let shows_session_action = approval_shows_session_action(&approval);
         let denial_buttons = approval_denial_actions(supports_approval_interrupt)
             .iter()
             .map(|action| {
@@ -5859,14 +5867,16 @@ impl Composer {
                     .gap(px(8.0))
                     .children(denial_buttons)
                     .child(div().flex_1())
-                    .child(button(
-                        "approval-allow-session",
-                        "Allow for this session",
-                        false,
-                        &theme,
-                        cx,
-                        comet_proto::ApprovalDecision::AllowForSession,
-                    ))
+                    .when(shows_session_action, |row| {
+                        row.child(button(
+                            "approval-allow-session",
+                            "Allow for this session",
+                            false,
+                            &theme,
+                            cx,
+                            comet_proto::ApprovalDecision::AllowForSession,
+                        ))
+                    })
                     .child(button(
                         "approval-allow",
                         "Allow",
@@ -6766,6 +6776,31 @@ mod tests {
             },
             "the fourth button's label must stay bound to the interrupting decision"
         );
+    }
+
+    #[test]
+    fn approval_session_action_is_omitted_when_the_request_has_no_safe_identity() {
+        let unavailable = comet_proto::ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: None,
+        };
+        let identified = comet_proto::ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: Some(comet_proto::McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "{}".into(),
+            }),
+        };
+
+        assert!(!approval_shows_session_action(&unavailable));
+        assert!(approval_shows_session_action(&identified));
+        assert!(approval_shows_session_action(
+            &comet_proto::ApprovalRequest::FileRead {
+                path: "a.rs".into()
+            }
+        ));
     }
 
     #[test]

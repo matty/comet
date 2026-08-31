@@ -7,7 +7,7 @@
 //! error — it becomes `Unknown` with Comet copy, because the alternative is
 //! either dropping the request (the agent hangs) or auto-allowing it.
 
-use comet_proto::{ApprovalRequest, FileOperation};
+use comet_proto::{ApprovalRequest, FileOperation, McpArgumentMetadata};
 
 use super::wire::ControlRequestBody;
 
@@ -122,6 +122,7 @@ pub(crate) fn approval_request(
             ApprovalRequest::Mcp {
                 server: server.to_owned(),
                 tool: tool.to_owned(),
+                arguments: McpArgumentMetadata::from_json(&body.input),
             }
         }
         name => unknown(name),
@@ -362,8 +363,100 @@ mod tests {
             ApprovalRequest::Mcp {
                 server: "linear".into(),
                 tool: "create_issue".into(),
+                arguments: McpArgumentMetadata::from_json(&json!({})),
             }
         );
+    }
+
+    #[test]
+    fn mcp_arguments_have_a_canonical_full_value_identity() {
+        let first = approval_request(
+            &body(
+                "mcp__linear__create_issue",
+                json!({
+                    "project": "COMET",
+                    "metadata": {"priority": 1, "assignee": {"name": "Ada", "id": 7}},
+                    "labels": ["bug", "urgent"]
+                }),
+            ),
+            nothing_exists,
+        );
+        let reordered = approval_request(
+            &body(
+                "mcp__linear__create_issue",
+                json!({
+                    "labels": ["bug", "urgent"],
+                    "metadata": {"assignee": {"id": 7, "name": "Ada"}, "priority": 1},
+                    "project": "COMET"
+                }),
+            ),
+            nothing_exists,
+        );
+        let changed = approval_request(
+            &body(
+                "mcp__linear__create_issue",
+                json!({"labels": ["bug"], "project": "COMET"}),
+            ),
+            nothing_exists,
+        );
+
+        fn metadata(request: &ApprovalRequest) -> &comet_proto::McpArgumentMetadata {
+            match request {
+                ApprovalRequest::Mcp {
+                    arguments: Some(arguments),
+                    ..
+                } => arguments,
+                other => panic!("expected MCP argument metadata, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            metadata(&first).identity,
+            "sha256:5391c90382138a876c07ea663eda418af92363e473bca8d2cc12fa6f7fbb0aa8"
+        );
+        assert_eq!(metadata(&first).identity, metadata(&reordered).identity);
+        assert_ne!(metadata(&first).identity, metadata(&changed).identity);
+    }
+
+    #[test]
+    fn mcp_argument_preview_is_bounded_and_masks_obvious_secrets() {
+        let request = approval_request(
+            &body(
+                "mcp__linear__create_issue",
+                json!({
+                    "apiToken": "must-not-enter-the-transcript",
+                    "description": "é".repeat(200),
+                }),
+            ),
+            nothing_exists,
+        );
+        let ApprovalRequest::Mcp {
+            arguments: Some(arguments),
+            ..
+        } = request
+        else {
+            panic!("expected MCP argument metadata");
+        };
+
+        assert!(arguments.preview.len() <= 160, "{:?}", arguments.preview);
+        assert!(arguments.preview.ends_with('…'), "{:?}", arguments.preview);
+        assert!(arguments.preview.contains("[redacted]"));
+        assert!(!arguments.preview.contains("must-not-enter-the-transcript"));
+        assert!(arguments.preview.is_char_boundary(arguments.preview.len()));
+    }
+
+    #[test]
+    fn an_mcp_request_with_absent_arguments_is_not_given_an_identity() {
+        let request = approval_request(
+            &body("mcp__linear__create_issue", serde_json::Value::Null),
+            nothing_exists,
+        );
+        assert!(matches!(
+            request,
+            ApprovalRequest::Mcp {
+                arguments: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -565,6 +658,7 @@ mod tests {
             ApprovalRequest::Mcp {
                 server: "linear".into(),
                 tool: "".into(),
+                arguments: McpArgumentMetadata::from_json(&json!({})),
             }
         );
     }
@@ -590,6 +684,7 @@ mod tests {
             ApprovalRequest::Mcp {
                 server: "mcp".into(),
                 tool: "foo".into(),
+                arguments: McpArgumentMetadata::from_json(&json!({})),
             }
         );
     }

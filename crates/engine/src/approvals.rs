@@ -43,19 +43,20 @@ pub(crate) fn approval_signature(request: &ApprovalRequest) -> Option<String> {
             path, operation, ..
         } => json!(["fileChange", path, format!("{operation:?}")]),
         ApprovalRequest::FileRead { path } => json!(["fileRead", path]),
-        // The only variant that names a CAPABILITY rather than an action.
-        // `Mcp` carries no arguments — `create_issue` on one project and
-        // `create_issue` on another are the same value — so a signature built
-        // from it would grant every future call of that tool, whatever it was
-        // asked to do. Every other kind's grant is narrow: the same command
-        // text, the same path. This one would not be, and the user cannot see
-        // the difference either, because the card renders `server · tool` and
-        // no arguments.
-        //
-        // So: allow the call in front of the user, remember nothing. Same
-        // treatment as `Unknown` below, for the same reason one field up.
-        // Carrying a discriminating digest of the arguments would fix it
-        // properly and needs a proto change (`docs/debt/README.md` D19).
+        ApprovalRequest::Mcp {
+            server,
+            tool,
+            arguments: Some(arguments),
+        } if !server.is_empty() && !tool.is_empty() && arguments.has_valid_identity() => {
+            // The preview is display-only and may change independently. The
+            // fixed digest covers the complete canonical argument value; the
+            // other two fields keep equal tool names on different MCP servers
+            // from sharing a grant.
+            json!(["mcp", server, tool, arguments.identity])
+        }
+        // Absent provider input, old wire data, and forged or malformed digest
+        // spellings all fail closed. None of them identifies an action narrowly
+        // enough to repeat without asking.
         ApprovalRequest::Mcp { .. } => return None,
         ApprovalRequest::Unknown { .. } => return None,
     };
@@ -293,17 +294,69 @@ mod tests {
     }
 
     #[test]
-    fn an_mcp_tool_is_never_allowlistable() {
-        // `Mcp` names a capability, not an action: it carries no arguments, so
-        // `create_issue` against one project and `create_issue` against another
-        // are the same value. A signature built from it would turn "allow this
-        // issue" into "allow every issue this tool ever creates", which is
-        // broader than any other kind's grant and broader than what the card
-        // showed the user (it renders `server · tool`, no arguments).
+    fn an_mcp_tool_is_keyed_on_server_tool_and_argument_identity() {
         let one = ApprovalRequest::Mcp {
             server: "linear".into(),
             tool: "create_issue".into(),
+            arguments: Some(comet_proto::McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "{\"project\":\"COMET\"}".into(),
+            }),
         };
-        assert_eq!(approval_signature(&one), None);
+        let reordered_preview = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: Some(comet_proto::McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "project=COMET".into(),
+            }),
+        };
+        let changed_arguments = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: Some(comet_proto::McpArgumentMetadata {
+                identity: format!("sha256:{}", "b".repeat(64)),
+                preview: "{\"project\":\"OTHER\"}".into(),
+            }),
+        };
+        let other_tool = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "update_issue".into(),
+            arguments: Some(comet_proto::McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "{\"project\":\"COMET\"}".into(),
+            }),
+        };
+
+        assert!(approval_signature(&one).is_some());
+        assert_eq!(
+            approval_signature(&one),
+            approval_signature(&reordered_preview)
+        );
+        assert_ne!(
+            approval_signature(&one),
+            approval_signature(&changed_arguments)
+        );
+        assert_ne!(approval_signature(&one), approval_signature(&other_tool));
+    }
+
+    #[test]
+    fn missing_or_malformed_mcp_argument_identity_is_never_allowlistable() {
+        let request = |arguments| ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments,
+        };
+        assert_eq!(approval_signature(&request(None)), None);
+        for identity in ["", "sha256:abc", &format!("sha256:{}", "x".repeat(64))] {
+            assert_eq!(
+                approval_signature(&request(Some(comet_proto::McpArgumentMetadata {
+                    identity: identity.into(),
+                    preview: "{}".into(),
+                }))),
+                None,
+                "malformed identity {identity:?} must fail closed"
+            );
+        }
     }
 }

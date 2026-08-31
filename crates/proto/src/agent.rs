@@ -1172,13 +1172,145 @@ pub enum ToolCall {
     },
 }
 
+/// A fixed-size identity for the complete MCP argument value plus the bounded
+/// text the approval card may show. The full arguments deliberately do not
+/// cross this boundary or enter the persisted transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpArgumentMetadata {
+    pub identity: String,
+    pub preview: String,
+}
+
+impl McpArgumentMetadata {
+    /// Reduce a decoded MCP argument value to the only two things Comet needs
+    /// after the approval is raised. `null` is the provider-wire fallback for
+    /// a missing or unreadable argument value, and must not become a grant key.
+    pub fn from_json(arguments: &serde_json::Value) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        if arguments.is_null() {
+            return None;
+        }
+        let canonical = canonical_json(arguments);
+        let bytes = serde_json::to_vec(&canonical).expect("a JSON value always serializes");
+        let mut identity = String::from("sha256:");
+        for byte in Sha256::digest(&bytes) {
+            write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+        }
+
+        let safe_preview = redact_preview_value(&canonical, None);
+        let preview = serde_json::to_string(&safe_preview).expect("a JSON value always serializes");
+        Some(Self {
+            identity,
+            preview: cap_mcp_preview(&preview),
+        })
+    }
+
+    /// The engine admits only the fixed SHA-256 spelling its own constructor
+    /// emits. A forged, malformed, or unbounded wire string is not a grant key.
+    pub fn has_valid_identity(&self) -> bool {
+        let Some(hex) = self.identity.strip_prefix("sha256:") else {
+            return false;
+        };
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    /// Re-apply the cap at the rendering boundary so a trusted LAN peer cannot
+    /// turn an additive wire field into unbounded card text.
+    pub fn bounded_preview(&self) -> String {
+        cap_mcp_preview(&self.preview)
+    }
+}
+
+pub const MCP_ARGUMENT_PREVIEW_MAX_BYTES: usize = 160;
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&object[key]));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn redact_preview_value(value: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
+    if key.is_some_and(sensitive_argument_key) {
+        return serde_json::Value::String("[redacted]".into());
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut safe = serde_json::Map::new();
+            for (key, value) in object {
+                safe.insert(key.clone(), redact_preview_value(value, Some(key)));
+            }
+            serde_json::Value::Object(safe)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| redact_preview_value(value, None))
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
+fn sensitive_argument_key(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    [
+        b"password".as_slice(),
+        b"passwd".as_slice(),
+        b"secret".as_slice(),
+        b"token".as_slice(),
+        b"apikey".as_slice(),
+        b"authorization".as_slice(),
+        b"cookie".as_slice(),
+        b"credential".as_slice(),
+        b"privatekey".as_slice(),
+    ]
+    .iter()
+    .any(|needle| normalized.windows(needle.len()).any(|part| part == *needle))
+}
+
+fn cap_mcp_preview(preview: &str) -> String {
+    if preview.len() <= MCP_ARGUMENT_PREVIEW_MAX_BYTES {
+        return preview.to_owned();
+    }
+    let mut end = MCP_ARGUMENT_PREVIEW_MAX_BYTES - '…'.len_utf8();
+    while !preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &preview[..end])
+}
+
 /// What a provider is asking permission to do, reduced to the fields a
 /// decision card renders — the same reduction [`ToolCall`] applies.
 ///
 /// A file change carries counts, never the patch: the render-parts policy
 /// strips heavy tool inputs before anything enters the doc, and an approval is
 /// subject to the same limit. A richer preview has to be read from the
-/// host-resident diff sidecar rather than carried here.
+/// host-resident diff sidecar rather than carried here. MCP is the bounded
+/// exception: it carries a fixed digest plus a compact preview, never the full
+/// argument payload, because both informed approval and session-grant identity
+/// depend on those arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ApprovalRequest {
@@ -1200,12 +1332,34 @@ pub enum ApprovalRequest {
     Mcp {
         server: String,
         tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<McpArgumentMetadata>,
     },
     /// A provider asked for something Comet does not model. `summary` is Comet
     /// copy naming the action, never provider prose.
     Unknown {
         summary: String,
     },
+}
+
+impl ApprovalRequest {
+    /// Whether this request has a narrow identity the engine can safely repeat
+    /// under an "Allow for this session" grant.
+    pub fn can_grant_for_session(&self) -> bool {
+        match self {
+            Self::Command { .. } | Self::FileRead { .. } => true,
+            Self::FileChange { operation, .. } => *operation != FileOperation::Unknown,
+            Self::Mcp {
+                server,
+                tool,
+                arguments: Some(arguments),
+            } => !server.is_empty() && !tool.is_empty() && arguments.has_valid_identity(),
+            Self::Mcp {
+                arguments: None, ..
+            }
+            | Self::Unknown { .. } => false,
+        }
+    }
 }
 
 /// Unit variants only, so `#[serde(other)]` applies: an operation a later
@@ -1799,6 +1953,7 @@ mod tests {
             ApprovalRequest::Mcp {
                 server: "linear".into(),
                 tool: "create_issue".into(),
+                arguments: None,
             },
             ApprovalRequest::Unknown {
                 summary: "an action Comet does not model".into(),
@@ -1811,6 +1966,101 @@ mod tests {
                 case
             );
         }
+    }
+
+    #[test]
+    fn mcp_argument_metadata_survives_literal_wire_json_while_old_json_stays_absent() {
+        let enriched = serde_json::json!({
+            "kind": "mcp",
+            "server": "linear",
+            "tool": "create_issue",
+            "arguments": {
+                "identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "preview": "{\"project\":\"COMET\"}"
+            }
+        });
+        let decoded: ApprovalRequest = serde_json::from_value(enriched.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            enriched,
+            "the digest and bounded preview are part of the literal wire contract"
+        );
+
+        let old = serde_json::json!({
+            "kind": "mcp",
+            "server": "linear",
+            "tool": "create_issue"
+        });
+        let decoded: ApprovalRequest = serde_json::from_value(old.clone()).unwrap();
+        assert!(
+            !decoded.can_grant_for_session(),
+            "an old peer's blind MCP request must not expose a session grant"
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            old,
+            "an older request with no argument metadata must remain explicitly absent"
+        );
+    }
+
+    #[test]
+    fn session_grant_availability_matches_the_request_identity() {
+        let valid_mcp: ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "kind": "mcp",
+            "server": "linear",
+            "tool": "create_issue",
+            "arguments": {
+                "identity": format!("sha256:{}", "a".repeat(64)),
+                "preview": "{}"
+            }
+        }))
+        .unwrap();
+        let missing_mcp: ApprovalRequest = serde_json::from_value(serde_json::json!({
+            "kind": "mcp",
+            "server": "linear",
+            "tool": "create_issue"
+        }))
+        .unwrap();
+        let malformed_mcp = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: Some(McpArgumentMetadata {
+                identity: "not-a-digest".into(),
+                preview: "{}".into(),
+            }),
+        };
+        let missing_tool = ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: String::new(),
+            arguments: Some(McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "{}".into(),
+            }),
+        };
+        let unreadable_edit = ApprovalRequest::FileChange {
+            path: "a.rs".into(),
+            operation: FileOperation::Unknown,
+            added_lines: 0,
+            removed_lines: 0,
+        };
+
+        assert!(valid_mcp.can_grant_for_session());
+        assert!(!missing_mcp.can_grant_for_session());
+        assert!(!malformed_mcp.can_grant_for_session());
+        assert!(!missing_tool.can_grant_for_session());
+        assert!(!unreadable_edit.can_grant_for_session());
+        assert!(
+            !ApprovalRequest::Unknown {
+                summary: "Take an action".into()
+            }
+            .can_grant_for_session()
+        );
+        assert!(
+            ApprovalRequest::FileRead {
+                path: "a.rs".into()
+            }
+            .can_grant_for_session()
+        );
     }
 
     #[test]
