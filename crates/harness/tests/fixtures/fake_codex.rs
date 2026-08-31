@@ -370,10 +370,16 @@ fn main() {
         simple_completed(&tid);
     } else if turn_line.contains("scenario:happy") {
         happy(&turn_line, &thread_line, &tid);
-    // NOTE: steer-race before steer — the first match wins, and "scenario:steer"
-    // is a prefix of "scenario:steer-race".
+    // NOTE: steer-race variants before steer-race before steer — each is a
+    // prefix of the next broader scenario marker.
+    } else if turn_line.contains("scenario:steer-race-orphan") {
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::OrphanEarly);
+    } else if turn_line.contains("scenario:steer-race-second-steer") {
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::SecondSteer);
+    } else if turn_line.contains("scenario:steer-race-missing-start") {
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::MissingStarted);
     } else if turn_line.contains("scenario:steer-race") {
-        steer_race(&mut stdin, &tid);
+        steer_race(&mut stdin, &tid, SteerRaceFollowup::Normal);
     } else if turn_line.contains("scenario:steer")
         // The real capture-recorder prompt (`record/scenarios/codex.rs`'s
         // `steer_request`), additive alongside the `scenario:steer` test
@@ -587,7 +593,15 @@ fn auto_reviewer(thread_line: &str, tid: &str) {
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
 }
 
-fn steer_race(stdin: &mut StdinLock<'_>, tid: &str) {
+#[derive(Clone, Copy)]
+enum SteerRaceFollowup {
+    Normal,
+    OrphanEarly,
+    MissingStarted,
+    SecondSteer,
+}
+
+fn steer_race(stdin: &mut StdinLock<'_>, tid: &str, followup: SteerRaceFollowup) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
@@ -606,16 +620,70 @@ fn steer_race(stdin: &mut StdinLock<'_>, tid: &str) {
         r#"{{"id":{sid},"error":{{"code":-32602,"message":"turn already completed"}}}}"#
     ));
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    if matches!(
+        followup,
+        SteerRaceFollowup::OrphanEarly | SteerRaceFollowup::SecondSteer
+    ) {
+        // This old-turn frame is already queued before the follow-up starts.
+        emit(
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#,
+        );
+    }
     // The harness must fall back to a follow-up turn/start carrying the text.
     let follow_line = read_line(stdin);
     let fid = rid(&follow_line);
     if follow_line.contains(r#""method":"turn/start""#) && follow_line.contains("redirect please") {
-        emit(&format!(
-            r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
-        ));
-        emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
-        emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#);
-        emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+        match followup {
+            SteerRaceFollowup::Normal => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                emit(
+                    r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#,
+                );
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::OrphanEarly => {
+                // A legal follow-up lifecycle and delta can beat its response.
+                emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                emit(
+                    r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"fallback"}}"#,
+                );
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::MissingStarted => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+            }
+            SteerRaceFollowup::SecondSteer => {
+                emit(&format!(
+                    r#"{{"id":{fid},"result":{{"turn":{{"id":"t-2"}}}}}}"#
+                ));
+                let second_line = read_line(stdin);
+                let sid = rid(&second_line);
+                if second_line.contains(r#""method":"turn/steer""#)
+                    && second_line.contains(r#""expectedTurnId":"t-2""#)
+                    && second_line.contains("redirect again")
+                {
+                    emit(&format!(r#"{{"id":{sid},"result":{{}}}}"#));
+                    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-2"}}}"#);
+                    emit(
+                        r#"{"method":"item/agentMessage/delta","params":{"itemId":"m2","delta":"second-steer"}}"#,
+                    );
+                    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-2"}}}"#);
+                } else {
+                    emit(&format!(
+                        r#"{{"id":{sid},"error":{{"code":-32602,"message":"expected second steer for t-2"}}}}"#
+                    ));
+                }
+            }
+        }
     } else {
         fail_turn(&fid, "expected fallback turn/start with steer text");
     }
@@ -1054,10 +1122,8 @@ fn stream_before_ack(tid: &str) {
 /// D48 selection: a notification that names no active turn and nothing
 /// queued, arriving AFTER `turn/completed`, while the session stays open for
 /// more steering (nothing failed and the mailbox is not dropped).
-/// `run_session`'s main loop has no gate on `router.active.is_some()` before
-/// decoding and forwarding a notification — see this scenario's driving
-/// test for the exact arm and why this documents CURRENT behavior, not an
-/// invariant the harness actually enforces.
+/// The following rate-limit update is deliberately session-scoped; the
+/// trailing delta is not. The regression test distinguishes them after Done.
 fn orphan_notification_after_completion(tid: &str) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
@@ -1065,6 +1131,9 @@ fn orphan_notification_after_completion(tid: &str) {
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":85}}}}"#,
+    );
     // Belongs to no turn: router.active is None here and nothing is queued.
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#);
 }

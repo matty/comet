@@ -900,6 +900,9 @@ async fn run_session(session: Session) {
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // A follow-up response opens its assistant entry before `incoming` drains.
+    // Drop turn content until the matching ordered lifecycle frame reaches it.
+    let mut content_fence: Option<String> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -912,9 +915,21 @@ async fn run_session(session: Session) {
         tokio::select! {
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
-                    "turn/started" => router.note_started(turn_id(&params)),
+                    "turn/started" => {
+                        let id = turn_id(&params);
+                        router.note_started(id.clone());
+                        if content_fence.as_deref() == Some(id.as_str()) {
+                            content_fence = None;
+                        }
+                    }
 
                     "item/agentMessage/delta" => {
+                        // Unowned provider content must not attach to a future transcript entry.
+                        if content_fence.is_some()
+                            || (router.active.is_none() && queued_steers.is_empty())
+                        {
+                            continue;
+                        }
                         streamed_text.insert(item_id(&params));
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::TextDelta { text }).await
@@ -924,6 +939,11 @@ async fn run_session(session: Session) {
                     }
 
                     "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                        if content_fence.is_some()
+                            || (router.active.is_none() && queued_steers.is_empty())
+                        {
+                            continue;
+                        }
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
                         {
@@ -935,6 +955,11 @@ async fn run_session(session: Session) {
                     // snapshot per change rather than a delta, which is why
                     // this is a replacement and needs no accumulator.
                     "turn/plan/updated" => {
+                        if content_fence.is_some()
+                            || (router.active.is_none() && queued_steers.is_empty())
+                        {
+                            continue;
+                        }
                         if let Some(event) = plan_update_event(&params)
                             && !send(&event_tx, event).await
                         {
@@ -943,6 +968,11 @@ async fn run_session(session: Session) {
                     }
 
                     "item/started" | "item/completed" => {
+                        if content_fence.is_some()
+                            || (router.active.is_none() && queued_steers.is_empty())
+                        {
+                            continue;
+                        }
                         let phase = if method == "item/started" {
                             Phase::Started
                         } else {
@@ -986,6 +1016,11 @@ async fn run_session(session: Session) {
                     }
 
                     "thread/tokenUsage/updated" => {
+                        if content_fence.is_some()
+                            || (router.active.is_none() && queued_steers.is_empty())
+                        {
+                            continue;
+                        }
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);
                         }
@@ -1054,6 +1089,7 @@ async fn run_session(session: Session) {
                                 &client,
                                 turn_start_params(&request, &thread_id, &text),
                                 &mut router,
+                                &mut content_fence,
                                 &event_tx,
                                 &mut assistant_message_id,
                                 &mut done_current,
@@ -1240,6 +1276,7 @@ async fn run_session(session: Session) {
                                     &client,
                                     turn_start_params(&request, &thread_id, &text),
                                     &mut router,
+                                    &mut content_fence,
                                     &event_tx,
                                     &mut assistant_message_id,
                                     &mut done_current,
@@ -1254,6 +1291,7 @@ async fn run_session(session: Session) {
                         &client,
                         turn_start_params(&request, &thread_id, &text),
                         &mut router,
+                        &mut content_fence,
                         &event_tx,
                         &mut assistant_message_id,
                         &mut done_current,
@@ -1363,13 +1401,15 @@ async fn steer_as_new_turn(
     client: &RpcClient,
     params: Value,
     router: &mut TurnRouter,
+    content_fence: &mut Option<String>,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
     assistant_message_id: &mut String,
     done_current: &mut bool,
 ) -> bool {
     match start_turn(client, params).await {
         Ok(id) => {
-            router.adopt_started(id);
+            router.adopt_started(id.clone());
+            *content_fence = Some(id);
             *done_current = false;
             let (prev, next) = rotate(assistant_message_id);
             send(

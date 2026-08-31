@@ -780,6 +780,135 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     }));
 }
 
+/// The rejected-steer response resolves outside the ordered notification
+/// queue. A late old-turn delta therefore must be dropped before `Steered`
+/// opens the fallback assistant entry.
+#[tokio::test]
+async fn rejected_steer_drops_an_orphan_queued_before_the_follow_up() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(&harness(), request("scenario:steer-race-orphan"), controls).await;
+
+    let steered_pos = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Steered { .. }))
+        .expect("fallback Steered event: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "orphaned")),
+        "old-turn content must not appear before or after Steered: {events:?}"
+    );
+    let post_steer_deltas: Vec<_> = events[steered_pos + 1..]
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        post_steer_deltas,
+        vec!["fallback"],
+        "only follow-up content may enter the assistant entry after Steered: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn second_steer_targets_the_first_follow_up_before_its_started_notice() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("first steer queued");
+    let mut stream = harness()
+        .run(request("scenario:steer-race-second-steer"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut second_sent = false;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event");
+            if !second_sent && matches!(event, AgentEvent::Done { .. }) {
+                steer
+                    .send(SteerMessage {
+                        prompt: "redirect again".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("second steer queued after first completion");
+                second_sent = true;
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("run finishes");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        2,
+        "fallback then native second steer: {events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "second-steer".into()
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "orphaned")),
+        "the first follow-up owns no old-turn content: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_without_started_still_emits_steered_and_finishes() {
+    let (controls, steer, _token) = controls("Yes");
+    steer
+        .send(SteerMessage {
+            prompt: "redirect please".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:steer-race-missing-start"),
+        controls,
+    )
+    .await;
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "the follow-up response owns its lifecycle even without turn/started: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Done { .. }))
+            .count(),
+        2,
+        "both turns terminate without waiting for turn/started: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn approvals_reach_the_approval_bridge_not_the_input_bridge() {
     // Approvals must reach the ENGINE's approval bridge (`request_approval`).
@@ -1565,19 +1694,8 @@ async fn turn_events_streamed_ahead_of_their_own_ack_are_not_lost_or_reordered()
     assert_eq!(events.len(), 4, "extra or missing events: {events:?}");
 }
 
-/// D48 known gap: `run_session`'s main loop has no gate on
-/// `router.active.is_some()` before decoding and forwarding a notification.
-/// A persistent session (steering stays open after a turn completes, per
-/// `codex/mod.rs`'s own module doc) can receive a stray event that names no
-/// turn and answers no queued steer — a genuinely orphaned notification —
-/// and it still becomes a normal `TextDelta` in the consumer's stream, AFTER
-/// the `Done` that ended the turn it has nothing to do with. This documents
-/// CURRENT behavior (a real gap against D48's own "no normal event follows a
-/// terminal result" invariant), not a fix — fixing it needs a change in
-/// `crates/harness/src/codex/mod.rs`'s notification arms, out of scope for a
-/// tests-only slice. See this PR's description for the proposed debt row.
 #[tokio::test]
-async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
+async fn codex_orphaned_turn_events_after_done_are_dropped_but_session_notices_survive() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(
         &harness(),
@@ -1597,12 +1715,8 @@ async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
         }),
         "{events:?}"
     );
-    let done_pos = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::Done { .. }))
-        .expect("a Done for the completed turn");
     assert_eq!(
-        events.get(done_pos),
+        events.get(2),
         Some(&AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -1611,21 +1725,24 @@ async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
         }),
         "{events:?}"
     );
-    // The known gap: a normal event, owned by no turn, still reaches the
-    // consumer AFTER the Done that ended the only turn this run ever had.
     assert_eq!(
-        events.get(done_pos + 1),
-        Some(&AgentEvent::TextDelta {
-            text: "orphaned".into()
+        events.get(3),
+        Some(&AgentEvent::Notice {
+            kind: NoticeKind::RateLimit,
+            severity: NoticeSeverity::Warning,
+            summary: "Codex usage is at 85% of its limit".into(),
+            detail: None,
+            key: Some("rateLimit".into()),
         }),
-        "expected the orphaned delta to survive past Done (documenting the gap); \
-         if this fails because the event is now GONE, the gap may already be \
-         fixed and this test should assert the correct behavior instead: {events:?}"
+        "the post-completion rate-limit notice is session-scoped: {events:?}"
     );
-    assert_eq!(
-        events.len(),
-        done_pos + 2,
-        "extra or missing events: {events:?}"
+    assert_eq!(events.len(), 4, "extra or missing events: {events:?}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text } if text == "orphaned"
+        )),
+        "the orphaned turn delta must not follow Done: {events:?}"
     );
 }
 
