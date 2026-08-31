@@ -815,14 +815,15 @@ impl Redactor {
                     let escaped_key = surface::escape_path_segment(&child_key);
                     let key_needed_escaping = matches!(escaped_key, std::borrow::Cow::Owned(_));
                     let candidate_path = format!("{path}.{escaped_key}");
-                    let diagnostic_child_path = if surface::is_identifier_shaped(&child_key) {
-                        format!("{diagnostic_path}.{escaped_key}")
-                    } else {
-                        format!("{diagnostic_path}.{{}}")
-                    };
                     let key_survives = !is_map
                         || surface::is_named_map_child(path, &child_key)
                         || allows_prefix(provider, &candidate_path);
+                    let diagnostic_child_path =
+                        if key_survives && surface::is_identifier_shaped(&child_key) {
+                            format!("{diagnostic_path}.{escaped_key}")
+                        } else {
+                            format!("{diagnostic_path}.{{}}")
+                        };
                     let (child_key, child_path) = if key_survives {
                         if key_needed_escaping {
                             self.escaped.insert(candidate_path.clone());

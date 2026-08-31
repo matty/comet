@@ -794,6 +794,39 @@ fn sanitize_dir_rejects_a_nested_map_without_revealing_a_mixed_parent_data_key()
     );
 }
 
+/// Declared map keys are data even when their spelling looks like an ordinary
+/// identifier, so a nested suspected map must fold an unnamed parent key.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_a_declared_map_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-declared-model-map",
+        &[
+            r#"{"type":"system","subtype":"init","modelUsage":{"claude":{"model-7f2c":{},"model-04b6":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-declared-model-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".modelUsage.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".modelUsage.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("claude"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
 /// The false-negative-avoidance half: an object whose keys are ordinary
 /// field names must still stage successfully.
 #[test]
