@@ -8,7 +8,7 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
     SessionCommandStatus, SessionMessageEntry, TranscriptFrame,
 };
-use comet_engine::{EngineCore, HarnessRegistry, JournaledEvent, RunJournal};
+use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::CodexHarness;
 use comet_proto::{
     AgentEvent, ApprovalDecision, DoneStatus, HarnessId, RunRequest, RuntimeMode, SessionStatus,
@@ -21,10 +21,32 @@ const CHAT: &str = "chat-provider-boundary";
 struct EngineFixture {
     client: RpcClient,
     core: EngineCore,
-    cwd: PathBuf,
-    _data_dir: tempfile::TempDir,
-    _codex_home: tempfile::TempDir,
+    files: FixtureFiles,
+}
+
+struct FixtureFiles {
+    data_dir: tempfile::TempDir,
+    codex_home: tempfile::TempDir,
     _cwd_dir: tempfile::TempDir,
+    cwd: PathBuf,
+}
+
+impl FixtureFiles {
+    fn assemble(&self) -> EngineCore {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(
+            CodexHarness::new()
+                .with_executable(env!("CARGO_BIN_EXE_engine-fake-codex"))
+                .with_codex_home(self.codex_home.path()),
+        ));
+        EngineCore::assemble(
+            self.data_dir.path(),
+            Arc::new(registry),
+            HarnessId::Codex,
+            None,
+        )
+        .expect("assemble engine core")
+    }
 }
 
 impl EngineFixture {
@@ -34,17 +56,14 @@ impl EngineFixture {
         let cwd_dir = tempfile::tempdir().expect("create run cwd");
         std::fs::write(codex_home.path().join("auth.json"), "{}").expect("write fake auth");
 
-        let registry = HarnessRegistry::new();
-        registry.register(Arc::new(
-            CodexHarness::new()
-                .with_executable(env!("CARGO_BIN_EXE_engine-fake-codex"))
-                .with_codex_home(codex_home.path()),
-        ));
-        let core =
-            EngineCore::assemble(data_dir.path(), Arc::new(registry), HarnessId::Codex, None)
-                .expect("assemble engine core");
-        let cwd = cwd_dir.path().to_path_buf();
-        let cwd_string = cwd.to_string_lossy().into_owned();
+        let files = FixtureFiles {
+            data_dir,
+            codex_home,
+            cwd: cwd_dir.path().to_path_buf(),
+            _cwd_dir: cwd_dir,
+        };
+        let core = files.assemble();
+        let cwd_string = files.cwd.to_string_lossy().into_owned();
         core.workspace
             .create_space(SPACE, &core.device_id, &cwd_string, None, false)
             .expect("create fixture space");
@@ -60,13 +79,24 @@ impl EngineFixture {
 
         let client = comet_rpc::memory_client(core.rpc_service());
         Self {
-            _data_dir: data_dir,
-            _codex_home: codex_home,
-            _cwd_dir: cwd_dir,
             core,
             client,
-            cwd,
+            files,
         }
+    }
+
+    /// The RPC client may own streams whose service clones retain doc/session
+    /// state, so consume the fixture before its TempDir guards can drop.
+    async fn shutdown(self) -> FixtureFiles {
+        let Self {
+            client,
+            core,
+            files,
+        } = self;
+        drop(client);
+        core.shutdown().await;
+        drop(core);
+        files
     }
 }
 
@@ -75,7 +105,7 @@ fn codex_request(fixture: &EngineFixture, prompt: &str, mode: RuntimeMode) -> Ru
         prompt: prompt.into(),
         harness: Some(HarnessId::Codex),
         model: Some("gpt-5.6-sol".into()),
-        cwd: fixture.cwd.to_string_lossy().into_owned(),
+        cwd: fixture.files.cwd.to_string_lossy().into_owned(),
         ..RunRequest::for_session(mode)
     }
 }
@@ -119,13 +149,28 @@ fn commands(fixture: &EngineFixture) -> Vec<SessionCommandEntry> {
         .expect("read fixture commands")
 }
 
-fn journal(fixture: &EngineFixture) -> Vec<JournaledEvent> {
-    fixture
-        .core
-        .sessions
-        .subscribe(CHAT, 0)
-        .expect("subscribe to fixture journal")
-        .0
+fn reopened_journal(files: &FixtureFiles) -> RunJournal {
+    RunJournal::open(files.data_dir.path().join("local-store/journals"))
+        .expect("open fixture journal")
+}
+
+fn stored_session_status(core: &EngineCore) -> Option<SessionStatus> {
+    core.workspace
+        .doc()
+        .read_sessions()
+        .expect("read stored fixture sessions")
+        .into_iter()
+        .find(|session| session.chat_id == CHAT)
+        .map(|session| session.status)
+}
+
+fn stored_entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    core.doc_host
+        .open(CHAT)
+        .expect("open stored fixture chat")
+        .doc()
+        .read_entries()
+        .expect("read stored fixture entries")
 }
 
 fn apply_message_frame(entries: &mut Vec<SessionMessageEntry>, frame: TranscriptFrame) {
@@ -138,7 +183,7 @@ async fn fixture_wires_codex_request_manual_title_and_rpc_harness_list() {
     let request = codex_request(&fixture, "fixture smoke", RuntimeMode::ApprovalRequired);
 
     assert_eq!(request.harness, Some(HarnessId::Codex));
-    assert_eq!(request.cwd, fixture.cwd.to_string_lossy());
+    assert_eq!(request.cwd, fixture.files.cwd.to_string_lossy());
     assert_eq!(
         fixture
             .core
@@ -156,6 +201,7 @@ async fn fixture_wires_codex_request_manual_title_and_rpc_harness_list() {
         .await
         .expect("list fixture harnesses");
     assert_eq!(harnesses[0]["id"], "codex");
+    let _files = fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -194,7 +240,8 @@ async fn fake_codex_model_discovery_and_command_endpoint_cross_engine_rpc() {
             .canonicalize()
             .expect("canonicalize child Codex home"),
         fixture
-            ._codex_home
+            .files
+            .codex_home
             .path()
             .canonicalize()
             .expect("canonicalize fixture Codex home")
@@ -204,11 +251,12 @@ async fn fake_codex_model_discovery_and_command_endpoint_cross_engine_rpc() {
         .client
         .call(
             comet_rpc::methods::LIST_COMMANDS,
-            serde_json::json!({"harness": "codex", "cwd": fixture.cwd}),
+            serde_json::json!({"harness": "codex", "cwd": fixture.files.cwd}),
         )
         .await
         .expect("list fake Codex commands");
     assert_eq!(commands["commands"], serde_json::json!([]));
+    let _files = fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -247,28 +295,50 @@ async fn fake_codex_rejected_resume_falls_back_to_a_fresh_durable_session() {
     )
     .await;
 
-    let replay = journal(&fixture);
+    let files = fixture.shutdown().await;
+    let restarted = files.assemble();
+    let replay = reopened_journal(&files)
+        .replay(CHAT, 0)
+        .expect("replay fixture journal");
     assert!(
         replay.iter().any(|entry| {
-            matches!(&entry.event, AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh")
+            matches!(&entry.1, AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh")
         }),
-        "the native Codex fallback must durably start th-fresh: {replay:?}"
+        "the native Codex fallback must persist th-fresh: {replay:?}"
     );
-    assert!(matches!(
-        replay.last().map(|entry| &entry.event),
-        Some(AgentEvent::Done {
-            status: DoneStatus::Completed,
-            session_id: Some(session_id),
-            ..
-        }) if session_id == "th-fresh"
-    ));
+    assert!(
+        replay.iter().any(|entry| {
+            matches!(
+                &entry.1,
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    session_id: Some(session_id),
+                    ..
+                } if session_id == "th-fresh"
+            )
+        }),
+        "the completed fallback turn must survive shutdown: {replay:?}"
+    );
+    assert!(
+        matches!(
+            replay.last().map(|entry| &entry.1),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "fixture shutdown must settle the parked Codex child: {replay:?}"
+    );
     assert_eq!(
-        fixture.core.workspace.chat_harness_session(CHAT),
+        restarted.workspace.chat_harness_session(CHAT),
         Some((
             "th-fresh".into(),
-            Some(fixture.cwd.to_string_lossy().into_owned()),
+            Some(files.cwd.to_string_lossy().into_owned()),
         ))
     );
+    assert_eq!(stored_session_status(&restarted), Some(SessionStatus::Idle));
+    restarted.shutdown().await;
+    drop(restarted);
 }
 
 #[tokio::test]
@@ -344,34 +414,6 @@ async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() 
     )
     .await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let frame: TranscriptFrame = serde_json::from_value(
-            tokio::time::timeout_at(deadline, messages.recv())
-                .await
-                .expect("aborted approval before timeout")
-                .expect("message stream remains open"),
-        )
-        .expect("deserialize terminal frame");
-        apply_message_frame(&mut materialized, frame);
-        if materialized.iter().any(|entry| {
-            entry.role == MessageRole::Assistant
-                && entry.status == Some(MessageStatus::Aborted)
-                && entry.parts.iter().any(|part| {
-                    matches!(
-                        part,
-                        MessagePart::Approval {
-                            request_id: resolved_id,
-                            decision: Some(ApprovalDecision::DenyAndInterrupt { message }),
-                            ..
-                        } if resolved_id == &request_id && message == "stop before touching that file"
-                    )
-                })
-        }) {
-            break;
-        }
-    }
-
     wait_for(
         || {
             let entries = commands(&fixture);
@@ -390,20 +432,45 @@ async fn fake_codex_cancelled_approval_round_trips_via_rpc_and_aborts_durably() 
     )
     .await;
 
-    let replay = journal(&fixture);
+    drop(messages);
+    let files = fixture.shutdown().await;
+    let restarted = files.assemble();
+    let entries = stored_entries(&restarted);
+    assert!(
+        entries.iter().any(|entry| {
+            entry.role == MessageRole::Assistant
+            && entry.status == Some(MessageStatus::Aborted)
+            && entry.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    MessagePart::Approval {
+                        request_id: resolved_id,
+                        decision: Some(ApprovalDecision::DenyAndInterrupt { message }),
+                        ..
+                    } if resolved_id == &request_id && message == "stop before touching that file"
+                )
+            })
+        }),
+        "stored document must retain the aborted approval: {entries:#?}"
+    );
+    assert_eq!(stored_session_status(&restarted), Some(SessionStatus::Idle));
+    let replay = reopened_journal(&files)
+        .replay(CHAT, 0)
+        .expect("replay fixture journal");
     assert!(matches!(
-        replay.last().map(|entry| &entry.event),
+        replay.last().map(|entry| &entry.1),
         Some(AgentEvent::Done {
             status: DoneStatus::Interrupted,
             ..
         })
     ));
     assert!(
-        RunJournal::open(fixture._data_dir.path().join("local-store/journals"))
-            .expect("open fixture journal")
+        reopened_journal(&files)
             .stale_sessions()
             .expect("scan fixture journal")
             .is_empty(),
         "interrupted approval must leave no stale session"
     );
+    restarted.shutdown().await;
+    drop(restarted);
 }
