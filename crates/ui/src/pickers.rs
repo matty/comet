@@ -486,6 +486,15 @@ pub enum PickerKind {
     Permissions,
 }
 
+/// The provider's existing user-facing state shown before a locked chat sends.
+/// Kept as two fields so the short state and the action retain their visual
+/// hierarchy instead of being flattened into another prose blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockedHarnessNotice {
+    pub(crate) summary: SharedString,
+    pub(crate) hint: Option<SharedString>,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -506,6 +515,10 @@ pub struct Pickers {
     /// In-flight guard for [`Self::revalidate_harnesses`], so repeated opens
     /// queue no more than one refetch.
     harness_revalidating: bool,
+    /// Owner generation for which a locked chat already started its one
+    /// bounded background poll. Prevents render from restarting the poll after
+    /// it reaches the cap; an explicit picker open may still retry later.
+    locked_harness_poll_generation: Option<u64>,
     revalidate_task: Option<Task<()>>,
     models: HashMap<HarnessId, Loadable<ModelCatalog>>,
     refs: Loadable<Vec<RepoRef>>,
@@ -654,6 +667,7 @@ impl Pickers {
             open,
             harnesses: Loadable::Idle,
             harness_revalidating: false,
+            locked_harness_poll_generation: None,
             revalidate_task: None,
             models: HashMap::new(),
             refs: Loadable::Idle,
@@ -696,6 +710,20 @@ impl Pickers {
         self.state.read(cx).selected_chat.is_some()
     }
 
+    /// The agent actually persisted on the selected chat.
+    ///
+    /// Existing legacy rows can have no config. Those rows are still locked by
+    /// the session UI, but they must not inherit a sticky/new-chat agent when
+    /// deciding whether to show an unavailable-agent warning.
+    fn committed_harness(&self, cx: &App) -> Option<HarnessId> {
+        self.state
+            .read(cx)
+            .selected_chat_row()?
+            .config
+            .as_ref()
+            .map(|config| config.harness)
+    }
+
     /// Whether a probe has come back saying this harness cannot run.
     ///
     /// False whenever the catalog has not loaded or the probe has not landed —
@@ -705,6 +733,16 @@ impl Pickers {
         self.harnesses
             .ready()
             .is_some_and(|list| harness_is_unavailable(list, harness))
+    }
+
+    /// A pre-send signal for an existing chat whose committed agent can no
+    /// longer run. This never blocks sending or unlocks the agent choice; it
+    /// only moves the catalog's existing recovery copy earlier in the flow.
+    pub(crate) fn locked_harness_notice(&self, cx: &App) -> Option<LockedHarnessNotice> {
+        locked_harness_notice(
+            self.committed_harness(cx),
+            self.harnesses.ready().map(Vec::as_slice),
+        )
     }
 
     fn engine(&self, cx: &App) -> Option<ServerClient> {
@@ -1121,6 +1159,25 @@ impl Pickers {
         harness_catalog_settled(&self.harnesses)
     }
 
+    /// The composer needs one chance to see probes land without requiring the
+    /// user to open a picker first. Start only after the initial catalog is
+    /// ready, and only once per selected-chat/space generation; the poll itself
+    /// is already bounded by [`HARNESS_REVALIDATE_ATTEMPTS`].
+    fn revalidate_locked_harness_once(&mut self, cx: &mut Context<Self>) {
+        if !locked_harness_poll_needed(
+            self.committed_harness(cx),
+            self.harness_revalidating,
+            self.owner_generation,
+            self.locked_harness_poll_generation,
+            &self.harnesses,
+        ) || self.engine(cx).is_none()
+        {
+            return;
+        }
+        self.locked_harness_poll_generation = Some(self.owner_generation);
+        self.revalidate_harnesses(cx);
+    }
+
     /// Poll the catalog while the picker is open and probes are still landing.
     ///
     /// Availability lands on the engine after boot, but the UI caches the
@@ -1135,12 +1192,15 @@ impl Pickers {
     /// unusable provider stays selectable until the picker is closed and
     /// reopened. Retrying until the answer settles closes both.
     ///
-    /// Driven by the picker OPENING, never by render: `ensure_harnesses` runs
-    /// every frame, and a revalidation there would spawn an RPC per frame.
+    /// Driven by the picker opening, or once per owner generation when an
+    /// existing chat needs the pre-send unavailable notice. The latter is
+    /// reached from render but guarded by `locked_harness_poll_generation`, so
+    /// it cannot spawn an RPC per frame.
     ///
-    /// Bounded three ways — it stops once every entry has an answer (a probed
-    /// *failure* is an answer), when the picker closes, and after
-    /// [`HARNESS_REVALIDATE_ATTEMPTS`] tries regardless. Hitting the cap just
+    /// Bounded three ways — a picker-owned poll stops once every entry has an
+    /// answer (a probed *failure* is an answer); a composer-owned poll stops as
+    /// soon as that chat's committed harness has an answer; and either stops
+    /// after [`HARNESS_REVALIDATE_ATTEMPTS`] tries regardless. Hitting the cap
     /// leaves the harness selectable, which is the same conservative state an
     /// unprobed harness always has.
     fn revalidate_harnesses(&mut self, cx: &mut Context<Self>) {
@@ -1193,15 +1253,24 @@ impl Pickers {
                             pickers.harnesses = Loadable::Ready(list);
                             cx.notify();
                         }
-                        pickers.harness_catalog_settled() || !pickers.harness_picker_open()
+                        !harness_poll_consumer_active(
+                            pickers.harness_picker_open(),
+                            pickers.committed_harness(cx),
+                            &pickers.harnesses,
+                        )
                     })
                     .unwrap_or(true);
                 if stop {
                     break;
                 }
             }
-            this.update(cx, |pickers, _| pickers.harness_revalidating = false)
-                .ok();
+            this.update(cx, |pickers, cx| {
+                pickers.harness_revalidating = false;
+                // A chat/space switch can make a different owner eligible
+                // while the previous owner's poll is winding down.
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -3413,6 +3482,43 @@ fn harness_catalog_settled(slot: &Loadable<Vec<HarnessDescriptor>>) -> bool {
         .is_some_and(|list| !catalog_awaits_probes(list))
 }
 
+fn locked_harness_poll_needed(
+    harness: Option<HarnessId>,
+    poll_in_flight: bool,
+    owner_generation: u64,
+    polled_generation: Option<u64>,
+    slot: &Loadable<Vec<HarnessDescriptor>>,
+) -> bool {
+    let Some(harness) = harness else {
+        return false;
+    };
+    !poll_in_flight
+        && polled_generation != Some(owner_generation)
+        && slot
+            .ready()
+            .is_some_and(|list| harness_awaits_probe(list, harness))
+}
+
+fn harness_awaits_probe(list: &[HarnessDescriptor], harness: HarnessId) -> bool {
+    list.iter()
+        .find(|descriptor| descriptor.id == harness)
+        .is_some_and(|descriptor| descriptor.availability.is_unprobed())
+}
+
+fn harness_poll_consumer_active(
+    picker_open: bool,
+    committed_harness: Option<HarnessId>,
+    slot: &Loadable<Vec<HarnessDescriptor>>,
+) -> bool {
+    if picker_open {
+        return !harness_catalog_settled(slot);
+    }
+    committed_harness.is_some_and(|harness| {
+        slot.ready()
+            .is_some_and(|list| harness_awaits_probe(list, harness))
+    })
+}
+
 /// Put cancelled slots back to `Idle` so the next `ensure_*` reloads them.
 /// Returns the harnesses actually re-armed, so a caller that needs to kick
 /// off their reload itself (`rearm_cancelled_models`) knows which ones.
@@ -3494,6 +3600,22 @@ fn harness_is_unavailable(list: &[HarnessDescriptor], harness: HarnessId) -> boo
     list.iter()
         .find(|d| d.id == harness)
         .is_some_and(|d| d.availability.is_unavailable())
+}
+
+fn locked_harness_notice(
+    harness: Option<HarnessId>,
+    list: Option<&[HarnessDescriptor]>,
+) -> Option<LockedHarnessNotice> {
+    let harness = harness?;
+    let descriptor = list?.iter().find(|descriptor| descriptor.id == harness)?;
+    let summary = descriptor.availability.unavailable_summary()?;
+    Some(LockedHarnessNotice {
+        summary: summary.to_owned().into(),
+        hint: descriptor
+            .availability
+            .unavailable_hint()
+            .map(|hint| hint.to_owned().into()),
+    })
 }
 
 /// What to do about a rail row that cannot be picked — the install hint for an
@@ -3598,6 +3720,7 @@ impl Render for Pickers {
         // Eager-load the harness catalog + effective harness's models so the
         // chip reads "Fable 5" (a concrete pick) before any popover opens.
         self.ensure_harnesses(cx);
+        self.revalidate_locked_harness_once(cx);
         if let Some(harness) = self.effective_harness(cx) {
             // `render` runs every frame — `force: true` here would re-spawn a
             // discovery subprocess per frame. See `ensure_models`.
@@ -4624,6 +4747,156 @@ mod tests {
         assert!(!harness_is_unavailable(&list, HarnessId::Cursor));
         // An empty catalog must not block everything.
         assert!(!harness_is_unavailable(&[], HarnessId::Codex));
+    }
+
+    /// A locked chat cannot switch agents, so the useful intervention is to
+    /// surface the catalog's existing install/override action before send.
+    /// Unknown and loading states are deliberately silent: neither is proof
+    /// that the committed agent cannot run.
+    #[test]
+    fn locked_chat_notice_reuses_only_a_landed_unavailability() {
+        use comet_proto::HarnessAvailability;
+        let with = |id: HarnessId, availability: HarnessAvailability| HarnessDescriptor {
+            id,
+            name: "n".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+            install: None,
+            update: None,
+        };
+        let list = vec![
+            with(HarnessId::ClaudeCode, HarnessAvailability::Unknown),
+            with(
+                HarnessId::Codex,
+                HarnessAvailability::unavailable(
+                    "Update required",
+                    Some("Update Codex, then try again.".into()),
+                ),
+            ),
+            with(
+                HarnessId::Mock,
+                HarnessAvailability::Available {
+                    version: Some("1.0.0".into()),
+                },
+            ),
+        ];
+
+        let notice = locked_harness_notice(Some(HarnessId::Codex), Some(&list))
+            .expect("a locked unavailable agent needs a pre-send notice");
+        assert_eq!(notice.summary.as_ref(), "Update required");
+        assert_eq!(
+            notice.hint.as_deref(),
+            Some("Update Codex, then try again.")
+        );
+
+        assert!(locked_harness_notice(Some(HarnessId::ClaudeCode), Some(&list)).is_none());
+        assert!(locked_harness_notice(Some(HarnessId::Mock), Some(&list)).is_none());
+        assert!(locked_harness_notice(Some(HarnessId::Cursor), Some(&list)).is_none());
+        assert!(
+            locked_harness_notice(None, Some(&list)).is_none(),
+            "a legacy chat without persisted config must not inherit a sticky/default warning"
+        );
+        assert!(locked_harness_notice(Some(HarnessId::Codex), None).is_none());
+    }
+
+    /// The first catalog normally lands before boot probes do. A composer
+    /// warning that never asks again would therefore exist in code yet stay
+    /// absent until the user happened to open an agent picker.
+    #[test]
+    fn locked_chat_refreshes_a_pre_probe_catalog_once_per_owner() {
+        use comet_proto::HarnessAvailability;
+        let descriptor = |availability| HarnessDescriptor {
+            id: HarnessId::Codex,
+            name: "Codex".into(),
+            capabilities: comet_proto::HarnessCapabilities::default(),
+            availability,
+            install: None,
+            update: None,
+        };
+        let waiting = Loadable::Ready(vec![descriptor(HarnessAvailability::Unknown)]);
+        let settled = Loadable::Ready(vec![descriptor(HarnessAvailability::Available {
+            version: Some("0.147.0".into()),
+        })]);
+        let unrelated_waiting = Loadable::Ready(vec![
+            descriptor(HarnessAvailability::Available {
+                version: Some("0.147.0".into()),
+            }),
+            HarnessDescriptor {
+                id: HarnessId::ClaudeCode,
+                name: "Claude Code".into(),
+                capabilities: comet_proto::HarnessCapabilities::default(),
+                availability: HarnessAvailability::Unknown,
+                install: None,
+                update: None,
+            },
+        ]);
+
+        assert!(locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            None,
+            &waiting
+        ));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            true,
+            7,
+            None,
+            &waiting
+        ));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            Some(7),
+            &waiting
+        ));
+        assert!(!locked_harness_poll_needed(None, false, 7, None, &waiting));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            None,
+            &settled
+        ));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            None,
+            &unrelated_waiting
+        ));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            None,
+            &Loadable::Loading
+        ));
+        assert!(!locked_harness_poll_needed(
+            Some(HarnessId::Codex),
+            false,
+            7,
+            None,
+            &Loadable::Error("offline".into())
+        ));
+        assert!(
+            locked_harness_poll_needed(Some(HarnessId::Codex), false, 8, Some(7), &waiting),
+            "selecting another chat gets one fresh bounded poll"
+        );
+        assert!(harness_poll_consumer_active(
+            false,
+            Some(HarnessId::Codex),
+            &waiting
+        ));
+        assert!(!harness_poll_consumer_active(
+            false,
+            Some(HarnessId::Codex),
+            &unrelated_waiting
+        ));
+        assert!(harness_poll_consumer_active(true, None, &unrelated_waiting));
+        assert!(!harness_poll_consumer_active(false, None, &waiting));
     }
 
     /// A cancel marker must never outlive the state it described. If it does,
