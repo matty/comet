@@ -1056,6 +1056,70 @@ async fn model_effort_settings_resume_and_the_real_child_cwd_reach_the_child() {
     );
 }
 
+/// D43's remaining gap was that every attachment assertion stopped before the
+/// subprocess boundary. This sends a real staged PNG through `ClaudeHarness`
+/// and reads the fake child's launch record, so a missing load, wrong base64,
+/// or text-before-image first message fails at the process boundary.
+#[tokio::test]
+async fn an_attachment_reaches_the_child_in_the_first_message() {
+    let dir = tempfile::tempdir().expect("temporary attachment directory");
+    let record_path = dir.path().join("launch-record.json");
+    let image_path = dir.path().join("attachment.png");
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        .expect("valid 1x1 PNG base64");
+    std::fs::write(&image_path, png).expect("write staged PNG");
+
+    let prompt = format!("scenario:launch-record|{}", record_path.display());
+    let mut req = request(&prompt);
+    req.attachments = vec![image_path.display().to_string()];
+    req.cwd = dir.path().display().to_string();
+
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "the launch-record scenario must complete: {events:?}"
+    );
+
+    let raw = std::fs::read_to_string(&record_path).expect("the fixture must write a record");
+    let record: serde_json::Value = serde_json::from_str(&raw).expect("valid launch record");
+    let first: serde_json::Value = serde_json::from_str(
+        record["first"]
+            .as_str()
+            .expect("the fixture records its first stdin message"),
+    )
+    .expect("first stdin message is JSON");
+    let content = first["message"]["content"]
+        .as_array()
+        .expect("an attachment uses block content");
+
+    assert_eq!(content.len(), 2, "first message content: {content:?}");
+    assert_eq!(
+        content[0]["type"], "image",
+        "first message content: {content:?}"
+    );
+    assert_eq!(content[0]["source"]["type"], "base64");
+    assert_eq!(content[0]["source"]["media_type"], "image/png");
+    assert_eq!(
+        content[0]["source"]["data"],
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        "the wire uses standard base64, not its URL-safe alphabet"
+    );
+    assert_eq!(
+        content[1]["type"], "text",
+        "first message content: {content:?}"
+    );
+    assert_eq!(content[1]["text"], prompt);
+}
+
 #[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");

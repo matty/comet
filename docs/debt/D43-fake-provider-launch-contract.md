@@ -26,3 +26,23 @@ argv lookup, cwd/environment capture and structured failure output.
 
 D34 separately owns relative executable resolution and its regression coverage;
 D43 should not absorb or block that fix.
+
+## Resolution, 2026-08-31
+
+The Claude and Codex integration suites now validate the invocation details
+production depends on. Claude rejects a run that lacks its streaming/control argv
+floor, while the existing launch-record scenario records the argv values and real
+child cwd the OS actually delivered. Codex independently checks its `app-server`
+subcommand and child-side cwd.
+
+The final Claude gap was attachments. `an_attachment_reaches_the_child_in_the_first_message`
+creates a temporary PNG, passes it as a real `RunRequest` attachment, and reads
+the fake Claude child's launch record. It asserts the child's first stdin user
+frame has the literal expected base64 `image/png` block before the original prompt
+text. A skipped image load, wrong encoding, or reversed content order therefore
+fails after crossing the subprocess boundary rather than only in wire-shape unit
+coverage.
+
+The record is deliberately the existing D43 launch-record mechanism, extended
+with that first stdin frame, rather than a parallel attachment-specific channel.
+D34 remains separate.
