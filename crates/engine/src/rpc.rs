@@ -2105,6 +2105,26 @@ mod tests {
         }
     }
 
+    /// Shared tail for a mock harness's `run`: every prompt other than the
+    /// one under test just parks until interrupted, same as a real run's
+    /// non-title turn would while the test manipulates the title path.
+    fn interrupted_run_stream(
+        controls: comet_harness::RunControls,
+    ) -> futures::stream::BoxStream<
+        'static,
+        Result<comet_proto::AgentEvent, comet_harness::HarnessError>,
+    > {
+        Box::pin(futures::stream::once(async move {
+            controls.interrupt.cancelled().await;
+            Ok(comet_proto::AgentEvent::Done {
+                status: comet_proto::DoneStatus::Interrupted,
+                result: None,
+                error: None,
+                session_id: None,
+            })
+        }))
+    }
+
     /// Holds title-model discovery across deletion so the detached task can
     /// be resumed after a same-id successor is live.
     struct DiscoveryPausedTitleHarness {
@@ -2173,15 +2193,7 @@ mod tests {
                 ])));
             }
 
-            Ok(Box::pin(futures::stream::once(async move {
-                controls.interrupt.cancelled().await;
-                Ok(comet_proto::AgentEvent::Done {
-                    status: comet_proto::DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: None,
-                })
-            })))
+            Ok(interrupted_run_stream(controls))
         }
     }
 
@@ -2249,15 +2261,7 @@ mod tests {
                 ])));
             }
 
-            Ok(Box::pin(futures::stream::once(async move {
-                controls.interrupt.cancelled().await;
-                Ok(comet_proto::AgentEvent::Done {
-                    status: comet_proto::DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: None,
-                })
-            })))
+            Ok(interrupted_run_stream(controls))
         }
     }
 

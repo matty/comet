@@ -682,12 +682,9 @@ impl SessionsEngine {
             if steerable && steer_tx.try_send(message).is_ok() {
                 let user_id = message_id.unwrap_or_else(new_id);
                 if let Some(handle) = expected_handle {
-                    let Some(written) = self.doc_host()?.with_current_handle(handle, || {
+                    self.doc_host()?.require_current(handle, || {
                         handle.write_user_message(&user_id, &request.prompt, now_ms())
-                    }) else {
-                        return Err(EngineError::ChatCleanupPendingRetry);
-                    };
-                    written?;
+                    })??;
                 } else {
                     let handle = self.doc_handle(chat_id)?;
                     handle.write_user_message(&user_id, &request.prompt, now_ms())?;

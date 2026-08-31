@@ -714,6 +714,17 @@ impl DocHost {
         self.with_current_handle(handle, || ()).is_some()
     }
 
+    /// [`Self::with_current_handle`], collapsed to the `ChatCleanupPendingRetry`
+    /// error every durable-write call site raises on a stale generation.
+    pub(crate) fn require_current<T>(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        effect: impl FnOnce() -> T,
+    ) -> Result<T, EngineError> {
+        self.with_current_handle(handle, effect)
+            .ok_or(EngineError::ChatCleanupPendingRetry)
+    }
+
     fn ensure_current_handle(&self, handle: &Arc<ChatDocHandle>) -> Result<(), EngineError> {
         self.is_current_handle(handle)
             .then_some(())
@@ -1183,12 +1194,7 @@ impl DocHost {
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
-                    let Some(claimed) = self
-                        .with_current_handle(handle, || ws.claim_chat(chat_id, Some(&request.cwd)))
-                    else {
-                        return Err(EngineError::ChatCleanupPendingRetry);
-                    };
-                    claimed?;
+                    self.require_current(handle, || ws.claim_chat(chat_id, Some(&request.cwd)))??;
                 }
                 let harness = self.harness_for_request(chat_id, request);
                 // The owner persists what it is about to dispatch so the row
@@ -1205,12 +1211,9 @@ impl DocHost {
                         sandbox: request.sandbox,
                         runtime_mode: request.runtime_mode,
                     };
-                    let Some(written) =
-                        self.with_current_handle(handle, || ws.set_chat_config(chat_id, &config))
-                    else {
-                        return Err(EngineError::ChatCleanupPendingRetry);
-                    };
-                    if let Err(err) = written {
+                    if let Err(err) =
+                        self.require_current(handle, || ws.set_chat_config(chat_id, &config))?
+                    {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
                 }
@@ -1280,12 +1283,9 @@ impl DocHost {
                 request_id,
                 answers,
             } => {
-                let Some(responded) = self.with_current_handle(handle, || {
+                if self.require_current(handle, || {
                     sessions.respond_input(chat_id, request_id, answers.clone())
-                }) else {
-                    return Err(EngineError::ChatCleanupPendingRetry);
-                };
-                if responded? {
+                })?? {
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver. Only a request id the doc shows as an
@@ -1339,12 +1339,9 @@ impl DocHost {
                 self.apply_chat_row_runtime_mode(chat_id, &mut request);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                let Some(resolved) =
-                    self.with_current_handle(handle, || handle.doc.resolve_input(request_id))
-                else {
-                    return Err(EngineError::ChatCleanupPendingRetry);
-                };
-                if let Err(err) = resolved {
+                if let Err(err) =
+                    self.require_current(handle, || handle.doc.resolve_input(request_id))?
+                {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
@@ -1373,12 +1370,9 @@ impl DocHost {
                         Some("Expired isn't a decision that can be sent.".into()),
                     ));
                 }
-                let Some(responded) = self.with_current_handle(handle, || {
+                if self.require_current(handle, || {
                     sessions.respond_approval(chat_id, request_id, decision.clone())
-                }) else {
-                    return Err(EngineError::ChatCleanupPendingRetry);
-                };
-                if responded? {
+                })?? {
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver, and no fallback is possible: the decision
