@@ -21,6 +21,7 @@ pub mod grok;
 pub mod hermes;
 pub(crate) mod normalize;
 pub mod session;
+pub(crate) mod subagent;
 
 use serde_json::{Value, json};
 

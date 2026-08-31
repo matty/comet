@@ -7,10 +7,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use comet_doc::{MessagePart, fold_event_into_parts};
 use comet_harness::acp::grok::GrokHarness;
+use comet_harness::acp::hermes::HermesHarness;
 use comet_harness::acp::session::Timeouts;
 use comet_harness::{CancellationToken, Harness, RunControls};
-use comet_proto::{AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode};
+use comet_proto::{
+    AgentEvent, CatalogSource, HarnessId, ReasoningLevel, RunRequest, RuntimeMode, SubagentStatus,
+};
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
@@ -39,6 +43,107 @@ fn against_fixture() -> GrokHarness {
 /// A path that resolves (so the override is honored) but cannot be spawned.
 fn missing_binary() -> PathBuf {
     std::env::temp_dir().join("comet-grok-does-not-exist")
+}
+
+fn controls() -> RunControls {
+    let (_steer_tx, steer_rx) = mpsc::channel(1);
+    RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    }
+}
+
+async fn events_for(harness: impl Harness, cwd: String, prompt: &str) -> Vec<AgentEvent> {
+    let mut stream = harness
+        .run(
+            RunRequest {
+                prompt: prompt.into(),
+                cwd,
+                ..RunRequest::for_session(RuntimeMode::default())
+            },
+            controls(),
+        )
+        .await
+        .expect("the fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let settled = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if settled {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the turn settles rather than hanging");
+    events
+}
+
+#[tokio::test]
+async fn grok_announcements_reach_the_transcript_and_collapse_by_id() {
+    let cwd = std::env::temp_dir().join("comet-grok-announcement-notices");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let events = events_for(
+        against_fixture(),
+        cwd.to_string_lossy().into_owned(),
+        "announcement-notices",
+    )
+    .await;
+    let notice_indices: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| matches!(event, AgentEvent::Notice { .. }).then_some(index))
+        .collect();
+    assert_eq!(
+        notice_indices.len(),
+        2,
+        "the fixture sends two occurrences: {events:#?}"
+    );
+    let first_text = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TextDelta { .. }))
+        .expect("the fixture streamed its normal response");
+    assert!(notice_indices.iter().all(|&index| index < first_text));
+
+    let mut parts = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+    {
+        fold_event_into_parts(&mut parts, event);
+    }
+    assert!(matches!(
+        parts.as_slice(),
+        [MessagePart::Notice { occurrences: 2, key: Some(key), .. }]
+            if key == "grok-announcement:fixture-release"
+    ));
+}
+
+#[tokio::test]
+async fn a_no_handler_acp_harness_keeps_grok_announcements_inert() {
+    let cwd = std::env::temp_dir().join("comet-hermes-announcement-notices");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+    let harness = HermesHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-acp"))
+        .with_timeouts(TEST_TIMEOUTS);
+
+    let events = events_for(
+        harness,
+        cwd.to_string_lossy().into_owned(),
+        "announcement-notices",
+    )
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice { .. })),
+        "a harness that injects no notification callback must ignore the vendor push: {events:#?}"
+    );
 }
 
 #[tokio::test]
@@ -282,4 +387,185 @@ async fn a_turn_that_streams_text_gets_a_completion_boundary_before_done() {
             .any(|e| matches!(e, AgentEvent::Diagnostic { .. })),
         "a healthy fixture turn must not report a diagnostic: {events:#?}"
     );
+}
+
+/// Break caught: Grok's vendor lifecycle being dropped as generic ACP chatter,
+/// which leaves a delegation as a plain tool chip while native providers draw
+/// a subagent card.
+#[tokio::test]
+async fn a_grok_subagent_lifecycle_reaches_the_native_card_events() {
+    let cwd = std::env::temp_dir().join("comet-grok-fixture-subagent");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = against_fixture();
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "grok-subagent-late".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("the fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let child_finished = matches!(
+                event,
+                AgentEvent::SubagentUpdated {
+                    status: SubagentStatus::Completed,
+                    ..
+                }
+            );
+            events.push(event);
+            if child_finished {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the child settles after its parent turn rather than hanging");
+    drop(steer_tx);
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentStarted {
+                task_id,
+                tool_use_id,
+                agent_type,
+                description,
+                prompt: Some(prompt),
+            } if task_id == "sub-1"
+                && tool_use_id == "sp1"
+                && agent_type == "explore"
+                && description == "Count files"
+                && prompt == "Count the files."
+        )),
+        "the correlated spawn must open the existing card: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentUpdated {
+                task_id,
+                status: SubagentStatus::Running,
+                activity: Some(activity),
+                ..
+            } if task_id == "sub-1" && activity == "Counting files"
+        )),
+        "the live activity must reach the card: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentUpdated {
+                task_id,
+                status: SubagentStatus::Completed,
+                summary: Some(summary),
+                tool_uses: Some(1),
+                ..
+            } if task_id == "sub-1" && summary == "two files"
+        )),
+        "the final wire output must settle the card: {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCall {
+                call: comet_proto::ToolCall::Unknown { name, .. },
+                ..
+            } if name == "spawn_subagent"
+        )),
+        "a correlated delegation must not also draw as a plain tool chip: {events:#?}"
+    );
+}
+
+/// Break caught: D105 moved D109's stateless callback into the stateful Grok
+/// observer so notifications could still flow while the parent was parked.
+/// Without a run-scoped exact-repeat guard, the same announcement id + payload
+/// is emitted again after `Done`, where the transcript can no longer collapse
+/// it into the earlier entry.
+#[tokio::test]
+async fn announcements_and_subagents_share_both_sides_of_done_without_exact_repeats() {
+    let cwd = std::env::temp_dir().join("comet-grok-subagent-announcement-boundary");
+    std::fs::create_dir_all(&cwd).expect("disposable cwd");
+
+    let harness = against_fixture();
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "grok-subagent-late-with-announcements".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let mut stream = harness
+        .run(request, controls)
+        .await
+        .expect("fixture starts");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("no transport error");
+            let saw_last_notice = matches!(
+                &event,
+                AgentEvent::Notice {
+                    key: Some(key),
+                    ..
+                } if key == "grok-announcement:boundary-distinct"
+            );
+            events.push(event);
+            if saw_last_notice {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("late lifecycle and announcements arrive while the parent is parked");
+    drop(steer_tx);
+
+    let done = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Done { .. }))
+        .expect("the parent turn settles");
+    let repeated: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            AgentEvent::Notice {
+                summary,
+                key: Some(key),
+                ..
+            } if key == "grok-announcement:boundary-repeat" => Some((index, summary.as_str())),
+            _ => None,
+        })
+        .collect();
+    let repeated_summaries: Vec<_> = repeated.iter().map(|(_, summary)| *summary).collect();
+    assert_eq!(
+        repeated_summaries,
+        ["Boundary announcement", "Boundary announcement updated"],
+        "one active-turn notice and one changed post-Done update must survive, but the exact post-Done repeat must not: {events:#?}"
+    );
+    assert!(repeated[0].0 < done && repeated[1].0 > done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SubagentUpdated {
+            status: SubagentStatus::Completed,
+            ..
+        }
+    )));
 }

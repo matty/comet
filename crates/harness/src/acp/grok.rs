@@ -50,6 +50,7 @@
 //! above; re-run it against a newer Grok build before assuming this finding
 //! still holds.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -59,11 +60,14 @@ use serde_json::{Value, json};
 
 use comet_proto::{
     AgentCommand, AgentEvent, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, Model,
-    ModelCatalog, ReasoningLevel, RunRequest, RuntimeMode, SteeringMode,
+    ModelCatalog, NoticeKind, NoticeSeverity, ReasoningLevel, RunRequest, RuntimeMode,
+    SteeringMode,
 };
 
 use super::AgentDescription;
-use super::session::{AcpSession, Discovered, SettleSignal, Timeouts};
+use super::session::{
+    AcpSession, Discovered, NotificationObservation, NotificationObserver, SettleSignal, Timeouts,
+};
 use crate::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use crate::launch::{LaunchDescriptor, StdioMode};
 use crate::{Harness, HarnessError, RunControls};
@@ -363,6 +367,119 @@ pub(crate) fn usage(result: &Value, context_window: Option<u64>) -> Option<Agent
         // `None` is "the agent did not say", never "no limit".
         context_window,
     })
+}
+
+const ANNOUNCEMENT_UPDATE_METHOD: &str = "_x.ai/announcements/update";
+const SETTINGS_UPDATE_METHOD: &str = "_x.ai/settings/update";
+
+/// Decode the two Grok-only announcement pushes observed in the 1.0.5 corpus.
+///
+/// Repeated ids become the same trailing transcript notice; missing ids stay
+/// keyless so the document does not merge unrelated announcements.
+fn announcement_notices(method: &str, params: &Value) -> Vec<AgentEvent> {
+    if !matches!(method, ANNOUNCEMENT_UPDATE_METHOD | SETTINGS_UPDATE_METHOD) {
+        return Vec::new();
+    }
+
+    params["announcements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|announcement| {
+            let title = announcement["title"]
+                .as_str()
+                .filter(|title| !title.is_empty());
+            let message = announcement["message"]
+                .as_str()
+                .filter(|message| !message.is_empty());
+            let summary = title.or(message)?;
+            let detail = title
+                .zip(message)
+                .map(|(_, message)| crate::cap_prose(message, crate::NOTICE_DETAIL_MAX));
+            Some(AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: match announcement["severity"].as_str() {
+                    Some("warning") => NoticeSeverity::Warning,
+                    _ => NoticeSeverity::Info,
+                },
+                summary: crate::cap_prose(summary, crate::NOTICE_SUMMARY_MAX),
+                detail,
+                key: announcement["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| format!("grok-announcement:{id}")),
+            })
+        })
+        .collect()
+}
+
+/// Grok's single provider-owned observer for vendor notifications.
+///
+/// Subagent frames are stateful and get first refusal. Announcement pushes are
+/// stateless and occupy disjoint method names, so composing them here keeps the
+/// shared ACP loop provider-neutral and prevents two hooks from competing for
+/// the same frame.
+struct GrokObserver {
+    subagents: super::subagent::SubagentTracker,
+    announcements: HashMap<String, AgentEvent>,
+    announcement_order: VecDeque<String>,
+}
+
+/// A persistent Grok session can receive vendor pushes between every turn.
+/// Keep exact-repeat suppression useful without letting distinct ids turn the
+/// observer into an allocator.
+const MAX_TRACKED_ANNOUNCEMENTS: usize = 64;
+
+impl GrokObserver {
+    fn new(session_id: String) -> Self {
+        Self {
+            subagents: super::subagent::SubagentTracker::new(session_id),
+            announcements: HashMap::new(),
+            announcement_order: VecDeque::new(),
+        }
+    }
+
+    fn new_announcements(&mut self, method: &str, params: &Value) -> Vec<AgentEvent> {
+        let mut fresh = Vec::new();
+        for event in announcement_notices(method, params) {
+            let key = match &event {
+                AgentEvent::Notice { key, .. } => key.as_ref(),
+                _ => None,
+            };
+            let Some(key) = key else {
+                fresh.push(event);
+                continue;
+            };
+            if self.announcements.get(key) == Some(&event) {
+                continue;
+            }
+            if !self.announcements.contains_key(key) {
+                if self.announcement_order.len() >= MAX_TRACKED_ANNOUNCEMENTS
+                    && let Some(evicted) = self.announcement_order.pop_front()
+                {
+                    self.announcements.remove(&evicted);
+                }
+                self.announcement_order.push_back(key.clone());
+            }
+            self.announcements.insert(key.clone(), event.clone());
+            fresh.push(event);
+        }
+        fresh
+    }
+}
+
+impl NotificationObserver for GrokObserver {
+    fn observe(&mut self, method: &str, params: &Value) -> NotificationObservation {
+        let observed = self.subagents.observe(method, params);
+        if observed.claimed {
+            return observed;
+        }
+
+        NotificationObservation {
+            events: self.new_announcements(method, params),
+            claimed: matches!(method, ANNOUNCEMENT_UPDATE_METHOD | SETTINGS_UPDATE_METHOD),
+        }
+    }
 }
 
 /// Grok's vendor extension: the AUTHORITATIVE turn-end signal. **Measured
@@ -767,15 +884,18 @@ impl Harness for GrokHarness {
             &request,
             config_requests,
             map_open_failure,
+            None,
         )
         .await?;
-        Ok(super::session::run(
+        let observer = GrokObserver::new(session.session_id().to_owned());
+        Ok(super::session::run_observed(
             session,
             HarnessId::Grok,
             request,
             controls,
             usage,
             Some(SETTLE_SIGNAL),
+            Some(Box::new(observer)),
         ))
     }
 }
@@ -785,6 +905,130 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn announcements_become_bounded_deduplicated_notices() {
+        let long = "x".repeat(crate::NOTICE_DETAIL_MAX + 120);
+        let notices = announcement_notices(
+            "_x.ai/announcements/update",
+            &json!({
+                "announcements": [
+                    {
+                        "id": "release-1",
+                        "title": "Important update",
+                        "message": long,
+                        "severity": "warning"
+                    },
+                    {
+                        "title": "A promotion",
+                        "message": "Try the new feature",
+                        "severity": "promo"
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0],
+            AgentEvent::Notice {
+                kind: comet_proto::NoticeKind::Info,
+                severity: comet_proto::NoticeSeverity::Warning,
+                summary: "Important update".into(),
+                detail: Some(crate::cap_prose(&long, crate::NOTICE_DETAIL_MAX)),
+                key: Some("grok-announcement:release-1".into()),
+            }
+        );
+        assert_eq!(
+            notices[1],
+            AgentEvent::Notice {
+                kind: comet_proto::NoticeKind::Info,
+                severity: comet_proto::NoticeSeverity::Info,
+                summary: "A promotion".into(),
+                detail: Some("Try the new feature".into()),
+                key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn announcements_tolerate_absent_fields_and_keep_repeat_ids_stable() {
+        let notices = announcement_notices(
+            SETTINGS_UPDATE_METHOD,
+            &json!({
+                "announcements": [
+                    {"id": "same", "message": "First"},
+                    {"id": "same", "message": "Second"},
+                    {"id": "ignored"},
+                    {"title": "Title only"},
+                    {"message": "Message only", "severity": "anything-else"}
+                ]
+            }),
+        );
+
+        assert_eq!(notices.len(), 4, "an announcement without prose is skipped");
+        let keys: Vec<_> = notices
+            .iter()
+            .map(|event| match event {
+                AgentEvent::Notice { key, .. } => key.as_deref(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Some("grok-announcement:same"),
+                Some("grok-announcement:same"),
+                None,
+                None
+            ]
+        );
+        assert!(matches!(
+            notices.last(),
+            Some(AgentEvent::Notice {
+                severity: NoticeSeverity::Info,
+                ..
+            })
+        ));
+        assert!(announcement_notices("_x.ai/models/update", &json!({})).is_empty());
+    }
+
+    /// Break caught: exact-repeat suppression needs run-scoped memory, but a
+    /// provider can mint unbounded announcement ids over a persistent session.
+    /// Once the 64-entry budget is exceeded, the oldest reading is forgotten
+    /// and may surface again rather than letting the observer become an
+    /// allocator.
+    #[test]
+    fn announcement_repeat_memory_evicts_the_oldest_reading() {
+        let mut observer = GrokObserver::new("session-1".into());
+        for index in 0..65 {
+            let observed = observer.observe(
+                ANNOUNCEMENT_UPDATE_METHOD,
+                &json!({
+                    "announcements": [{
+                        "id": format!("notice-{index}"),
+                        "title": "Same visible payload"
+                    }]
+                }),
+            );
+            assert_eq!(observed.events.len(), 1);
+        }
+
+        let oldest_again = observer.observe(
+            ANNOUNCEMENT_UPDATE_METHOD,
+            &json!({
+                "announcements": [{
+                    "id": "notice-0",
+                    "title": "Same visible payload"
+                }]
+            }),
+        );
+        assert_eq!(
+            oldest_again.events.len(),
+            1,
+            "the oldest exact reading must be evicted once the bounded cache fills"
+        );
+    }
 
     /// Break caught: reordering Grok's launch tokens. `--no-auto-update` is
     /// top-level, `--no-leader` belongs to `agent`, and `stdio` is under

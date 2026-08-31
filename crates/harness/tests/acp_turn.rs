@@ -150,6 +150,7 @@ async fn open_with(no_steering: bool, timeouts: Timeouts) -> AcpSession {
         // written here at all -- only a closure whose parameter type Rust
         // infers from `AcpSession::open`'s own signature.
         |_| None,
+        None,
     )
     .await
     .expect("the fixture handshakes")
@@ -1408,6 +1409,7 @@ async fn a_session_new_failure_reaches_the_caller_through_the_open_failure_mappe
                 None
             }
         },
+        None,
     )
     .await;
 
@@ -1458,6 +1460,7 @@ async fn a_refused_session_setting_reports_copy_rather_than_the_agent_s_own_word
             )]
         },
         |_| None,
+        None,
     )
     .await;
 

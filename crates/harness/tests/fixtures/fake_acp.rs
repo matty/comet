@@ -30,6 +30,8 @@
 //! | `request-permission` | sends `session/request_permission` mid-turn with all four ACP option kinds, then — once answered — echoes `"chosen:<optionId or cancelled>"` as a text chunk and settles `end_turn`. Lets a test observe which option the client picked without reading raw wire bytes. |
 //! | `request-permission-unrecognized` | identical, but the options carry no kind this build recognizes (`vendor_custom` only) — poses the protocol-drift case, which a correct client answers `cancelled` on its own, never touching the approval bridge |
 //! | `request-permission-edit` | identical, but `toolCall.kind` is `"edit"` with a `diff` content block and the options are Hermes' real two-option edit shape (`allow_once`/`reject_once`, no `allow_always` at all) — poses the shape `AllowForSession`'s narrow-to-`allow_once` fallback exists for |
+//! | `grok-subagent-late` | sends Grok's `spawn_subagent` tool frames plus spawned/progress lifecycle notifications, settles the parent turn, then sends `subagent_finished` after a delay on `_x.ai/session_notification` |
+//! | `grok-subagent-late-with-announcements` | the same late subagent lifecycle, plus one announcement during the turn and an exact repeat, changed same-id update, and distinct-id update after `Done` |
 //! | anything else   | one text chunk, then `stopReason: "end_turn"`, no completion notification |
 //!
 //! **`starve` and `ignore-cancel` are not the same mode**, and the difference
@@ -575,6 +577,105 @@ fn handle_prompt(
             "content": {"type": "text", "text": "working"},
         }));
         return None;
+    }
+
+    if text.contains("grok-subagent-late") {
+        let with_announcements = text.contains("with-announcements");
+        // Grok 1.0.4's real shape: the spawn is an ordinary ACP tool call,
+        // while lifecycle updates use the vendor notification method with the
+        // same `{sessionId, update}` envelope as `session/update`.
+        update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sp1",
+            "title": "spawn_subagent",
+            "rawInput": {
+                "description": "Count files",
+                "prompt": "Count the files.",
+                "subagent_type": "explore"
+            },
+            "_meta": {"x.ai/tool": {"name": "spawn_subagent"}}
+        }));
+        update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sp1",
+            "status": "completed",
+            "rawOutput": {
+                "type": "Text",
+                "text": "Subagent started in background.\nsubagent_id: sub-1\ntype: explore"
+            }
+        }));
+        let lifecycle = |payload: Value| {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": "_x.ai/session_notification",
+                "params": {"sessionId": session_id, "update": payload},
+            }));
+        };
+        let announcement = |id: &str, message: &str| {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": "_x.ai/announcements/update",
+                "params": {"announcements": [{
+                    "id": id,
+                    "title": message,
+                    "severity": "warning"
+                }]}
+            }));
+        };
+        if with_announcements {
+            announcement("boundary-repeat", "Boundary announcement");
+        }
+        lifecycle(json!({
+            "sessionUpdate": "subagent_spawned",
+            "subagent_id": "sub-1",
+            "parent_session_id": session_id,
+            "child_session_id": "sub-1",
+            "subagent_type": "explore",
+            "description": "Count files"
+        }));
+        lifecycle(json!({
+            "sessionUpdate": "subagent_progress",
+            "subagent_id": "sub-1",
+            "status": "running",
+            "description": "Counting files"
+        }));
+        emit(&json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}}));
+        // The parent can finish while a background child keeps running. The
+        // client must continue consuming Grok lifecycle notifications while
+        // it waits for a steer, or this terminal update sits unread forever.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        lifecycle(json!({
+            "sessionUpdate": "subagent_finished",
+            "subagent_id": "sub-1",
+            "status": "completed",
+            "tool_calls": 1,
+            "turns": 1,
+            "output": "two files"
+        }));
+        if with_announcements {
+            announcement("boundary-repeat", "Boundary announcement");
+            announcement("boundary-repeat", "Boundary announcement updated");
+            announcement("boundary-distinct", "Another announcement");
+        }
+        return None;
+    }
+
+    if text.contains("announcement-notices") {
+        for (method, message) in [
+            ("_x.ai/settings/update", "First fixture announcement"),
+            ("_x.ai/announcements/update", "Updated fixture announcement"),
+        ] {
+            emit(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": {"announcements": [{
+                    "id": "fixture-release",
+                    "title": "Fixture release",
+                    "message": message,
+                    "severity": "warning",
+                }]},
+            }));
+        }
     }
 
     if text.contains("echo-selection") {

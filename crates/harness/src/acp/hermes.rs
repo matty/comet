@@ -565,6 +565,7 @@ impl Harness for HermesHarness {
             &request,
             config_requests,
             map_open_failure,
+            None,
         )
         .await?;
         Ok(super::session::run(

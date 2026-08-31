@@ -1,22 +1,13 @@
-//! `HermesHarness` identity and capability contract.
-//!
-//! **No fixture-backed end-to-end test here, unlike `tests/grok.rs`.** The
-//! `fake-acp` fixture (`crates/harness/tests/fixtures/fake_acp.rs`) sends no
-//! `usage` block on `session/prompt` at all today — Grok's own usage decode is
-//! likewise only ever pinned at the unit level, never exercised through a live
-//! fixture turn — and that fixture belongs to a different branch in this
-//! plan (PR5). What is here mirrors the identity/capability half of
-//! `tests/grok.rs`'s own `the_harness_identifies_itself_consistently`; the
-//! literal-wire-pinned decode tests (launch line, usage split, model shape)
-//! live as unit tests inside `crates/harness/src/acp/hermes.rs` instead, the
-//! same place Grok's own equivalents live — see that file's test module for
-//! why `crates/harness/tests/hermes.rs` cannot reach `grok::usage` or
-//! `normalize::usage` at all (`pub(crate)`, and `normalize` is a
-//! `pub(crate) mod`).
+//! `HermesHarness` identity, capability, and provider-isolation contract.
 
-use comet_harness::Harness;
+use std::time::Duration;
+
 use comet_harness::acp::hermes::HermesHarness;
-use comet_proto::{HarnessId, SteeringMode};
+use comet_harness::acp::session::Timeouts;
+use comet_harness::{CancellationToken, Harness, RunControls};
+use comet_proto::{AgentEvent, HarnessId, RunRequest, RuntimeMode, SteeringMode};
+use futures::StreamExt;
+use tokio::sync::{mpsc, oneshot};
 
 /// The registry's lazy descriptor names `HermesHarness::capabilities()`, so the
 /// catalog entry shown before first use must equal what the trait reports after
@@ -49,4 +40,52 @@ fn steering_falls_back_to_the_turn_boundary() {
     let caps = HermesHarness::capabilities();
     assert!(caps.supports_steering);
     assert_eq!(caps.steering_mode, SteeringMode::TurnBoundary);
+}
+
+/// Break caught: installing Grok's vendor observer in the shared ACP path,
+/// which would make Hermes interpret `_x.ai/session_notification` frames it
+/// never advertised as its own subagents.
+#[tokio::test]
+async fn grok_subagent_extensions_remain_inert_for_hermes() {
+    let harness = HermesHarness::new()
+        .with_executable(env!("CARGO_BIN_EXE_fake-acp"))
+        .with_timeouts(Timeouts {
+            handshake: Duration::from_secs(10),
+            cancel_grace: Duration::from_millis(750),
+            kill_grace: Duration::from_millis(250),
+            prompt_stall: Duration::from_secs(10),
+        });
+    let (steer_tx, steer_rx) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_approval: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let request = RunRequest {
+        prompt: "grok-subagent-late".into(),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        ..RunRequest::for_session(RuntimeMode::default())
+    };
+    let stream = harness
+        .run(request, controls)
+        .await
+        .expect("fixture starts");
+    drop(steer_tx);
+    let events: Vec<AgentEvent> = tokio::time::timeout(
+        Duration::from_secs(20),
+        stream
+            .map(|event| event.expect("no transport error"))
+            .collect(),
+    )
+    .await
+    .expect("the parent turn settles");
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentUpdated { .. }
+        )),
+        "Grok vendor lifecycle must remain invisible to Hermes: {events:#?}"
+    );
 }
