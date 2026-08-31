@@ -20,10 +20,14 @@ transport handling.
 A rejected `turn/steer` response is resolved outside the FIFO notification
 queue. It can therefore be followed by the old turn's `turn/completed` and
 an orphaned delta before the fallback `turn/start` response. The fallback now
-stores only that response's turn id. It adopts the turn and emits `Steered`
-only when the matching ordered `turn/started` notification is consumed, so the
-old queued delta reaches the drop gate while it is still unowned. This is an
-ordering fence, not a buffer or a synthetic owner.
+immediately adopts that response's turn id and emits `Steered`, restoring
+normal follow-up steering and interrupt ownership. Separately, a content fence
+keyed by that id drops turn-scoped content until the matching ordered
+`turn/started` notification clears only that fence. The old queued delta is
+therefore discarded rather than attached to the follow-up entry. Lifecycle and
+completion notifications stay live while the fence is set: a missing or delayed
+`turn/started` cannot block `Done`, and a later follow-up response replaces any
+stale fence. This is an ordering fence, not a buffer or a synthetic owner.
 
 The real spawned fake-Codex regressions
 `codex_orphaned_turn_events_after_done_are_dropped_but_session_notices_survive`
