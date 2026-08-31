@@ -18,6 +18,24 @@ peer ignores the new key and also takes the heuristic. The compatibility
 ruling stays beside `PROTOCOL_VERSION` in `crates/proto/src/remote.rs`, the
 source that owns it.
 
+## D37 — live service-tier removal
+
+Codex's `model/list` is authoritative for service-tier availability only when
+it successfully returns the field for a matched model. An explicitly empty
+`serviceTiers` list removes that model's curated `serviceTier` option; a
+missing field, an unmatched curated model, or failed discovery keeps the
+curated fallback. Other curated capabilities continue to win the generic
+merge because the providers still under-report them.
+
+The picker keeps a remembered service-tier choice in draft or chat state while
+the option is unavailable, but filters it out of the effective run request.
+That makes model switches and temporary catalog changes reversible without
+sending a tier the live model rejected.
+
+No `PROTOCOL_VERSION` bump is needed: the availability bit never enters the
+wire model. It only changes the contents of the existing `Model.options` list,
+whose entries are catalog data older peers already consume dynamically.
+
 ## D1 — empty `ReasoningDelta` while parked
 
 **The bug.** `sessions.rs`'s run loop treats the first event after parking as the
