@@ -1158,6 +1158,31 @@ fn thread_setup_stall_fixture_path() -> &'static str {
     env!("CARGO_BIN_EXE_fake-codex-thread-setup-stall")
 }
 
+fn turn_start_stall_fixture_path() -> &'static str {
+    env!("CARGO_BIN_EXE_fake-codex-turn-start-stall")
+}
+
+const REAL_PROCESS_START_BOUND: Duration = Duration::from_millis(500);
+const CANCELLATION_TURN_START_BOUND: Duration = Duration::from_secs(2);
+const TURN_START_TEST_DEADLINE: Duration = Duration::from_secs(5);
+
+async fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> u32 {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(path) {
+            return pid.trim().parse().unwrap_or_else(|error| {
+                panic!("fixture pid parses from {}: {error}", path.display())
+            });
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture never recorded its pid at {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// `codex_startup_timeout_is_terminal_private_and_reaped` (above) proves the
 /// timeout covers `initialize`. This proves it also covers `thread/start` —
 /// the SECOND await inside `run_session`'s `setup` future — which nothing
@@ -1169,14 +1194,14 @@ async fn codex_startup_timeout_covers_thread_setup_not_just_initialize() {
     let (controls, _steer, _token) = controls("Yes");
     let harness = CodexHarness::new()
         .with_executable(thread_setup_stall_fixture_path())
-        .with_startup_timeout(Duration::from_millis(50))
+        .with_startup_timeout(REAL_PROCESS_START_BOUND)
         .with_graces(Duration::from_millis(10), Duration::from_millis(10));
     let stream = harness
         .run(request("scenario:happy"), controls)
         .await
         .expect("stall fixture starts");
     let events = tokio::time::timeout(
-        Duration::from_secs(2),
+        TURN_START_TEST_DEADLINE,
         stream
             .map(|event| event.expect("normalized event"))
             .collect::<Vec<_>>(),
@@ -1200,6 +1225,299 @@ async fn codex_startup_timeout_covers_thread_setup_not_just_initialize() {
         !format!("{events:?}").contains("D45_THREAD_SETUP_STALL_PRIVATE_DIAGNOSTIC"),
         "owner-local stderr leaked into the transcript event: {events:?}"
     );
+}
+
+/// `turn/start` runs after the startup setup future and used to await a reply
+/// forever. The fixture reaches that exact request through a real subprocess,
+/// so a timeout wrapped only around initialize or thread setup cannot satisfy
+/// this test.
+#[tokio::test]
+async fn codex_turn_start_timeout_is_terminal_private_and_reaped() {
+    let (controls, _steer, _token) = controls("Yes");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pid_file = temp.path().join("turn-start-pid");
+    let harness = CodexHarness::new()
+        .with_executable(turn_start_stall_fixture_path())
+        .with_startup_timeout(REAL_PROCESS_START_BOUND)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let stream = harness
+        .run(
+            request(&format!("scenario:turn-start-stall|{}", pid_file.display())),
+            controls,
+        )
+        .await
+        .expect("stall fixture starts");
+    let pid = wait_for_pid_file(&pid_file, TURN_START_TEST_DEADLINE).await;
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("turn/start timeout must close the stream after reaping the child");
+
+    assert!(
+        matches!(
+            events.first(),
+            Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "th-1"
+        ),
+        "setup must finish before the turn-start timeout: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("Codex stopped responding. Try again.".into()),
+            session_id: Some("th-1".into()),
+        }),
+        "turn/start silence needs a user-safe terminal result: {events:?}"
+    );
+    assert_eq!(events.len(), 2, "extra or missing events: {events:?}");
+    assert!(
+        !format!("{events:?}").contains("D134_TURN_START_STALL_PRIVATE_DIAGNOSTIC"),
+        "owner-local stderr leaked into the transcript event: {events:?}"
+    );
+    wait_for_process_exit(pid, TURN_START_TEST_DEADLINE)
+        .await
+        .unwrap_or_else(|message| panic!("turn-start fixture {message}"));
+}
+
+/// Cancellation must also preempt a silent `turn/start`, rather than waiting
+/// for the regular bound. This names a separate regression from the timeout:
+/// dropping the interrupt arm from the shared start helper must fail here.
+#[tokio::test]
+async fn cancelling_during_codex_turn_start_is_terminal() {
+    let (controls, _steer, token) = controls("Yes");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pid_file = temp.path().join("turn-start-pid");
+    let harness = CodexHarness::new()
+        .with_executable(turn_start_stall_fixture_path())
+        .with_startup_timeout(CANCELLATION_TURN_START_BOUND)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let mut stream = harness
+        .run(
+            request(&format!("scenario:turn-start-stall|{}", pid_file.display())),
+            controls,
+        )
+        .await
+        .expect("stall fixture starts");
+
+    let started = tokio::time::timeout(TURN_START_TEST_DEADLINE, stream.next())
+        .await
+        .expect("setup reaches SessionStarted")
+        .expect("SessionStarted event")
+        .expect("normalized SessionStarted event");
+    assert!(
+        matches!(started, AgentEvent::SessionStarted { ref session_id, .. } if session_id == "th-1"),
+        "fixture reached turn/start only after setup: {started:?}"
+    );
+
+    let pid = wait_for_pid_file(&pid_file, TURN_START_TEST_DEADLINE).await;
+    token.cancel();
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("interrupt must preempt a silent turn/start");
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }]
+    );
+    wait_for_process_exit(pid, TURN_START_TEST_DEADLINE)
+        .await
+        .unwrap_or_else(|message| panic!("turn-start fixture {message}"));
+}
+
+#[tokio::test]
+async fn provider_turn_start_error_is_safe_before_the_first_turn() {
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new()
+        .with_executable(turn_start_stall_fixture_path())
+        .with_startup_timeout(REAL_PROCESS_START_BOUND);
+    let stream = harness
+        .run(request("scenario:turn-start-private-error"), controls)
+        .await
+        .expect("error fixture starts");
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("provider error must close the stream");
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("Codex couldn't start a turn. Try again.".into()),
+            session_id: Some("th-1".into()),
+        }),
+        "provider error needs user-safe terminal copy: {events:?}"
+    );
+    assert!(
+        !format!("{events:?}").contains("D134_PRIVATE_PROVIDER_ERROR"),
+        "provider error leaked into the transcript: {events:?}"
+    );
+}
+
+async fn completed_turn_then_fallback(
+    fallback_prompt: String,
+    turn_start_timeout: Duration,
+) -> (
+    futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+    mpsc::Sender<SteerMessage>,
+    CancellationToken,
+) {
+    let (controls, steer, token) = controls("Yes");
+    let harness = CodexHarness::new()
+        .with_executable(turn_start_stall_fixture_path())
+        .with_startup_timeout(turn_start_timeout)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10));
+    let mut stream = harness
+        .run(
+            request("scenario:steer-fallback-turn-start-stall"),
+            controls,
+        )
+        .await
+        .expect("fallback fixture starts");
+    loop {
+        let event = tokio::time::timeout(TURN_START_TEST_DEADLINE, stream.next())
+            .await
+            .expect("first turn completes")
+            .expect("first turn event")
+            .expect("normalized first turn event");
+        if matches!(
+            event,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    steer
+        .send(SteerMessage {
+            prompt: fallback_prompt,
+            message_id: None,
+        })
+        .await
+        .expect("fallback steer queued");
+    (stream, steer, token)
+}
+
+#[tokio::test]
+async fn provider_turn_start_error_is_a_safe_terminal_done_for_a_steer_fallback() {
+    let (stream, _steer, _token) = completed_turn_then_fallback(
+        "scenario:turn-start-private-error".into(),
+        REAL_PROCESS_START_BOUND,
+    )
+    .await;
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("fallback provider error must close the stream");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("Codex couldn't start a turn. Try again.".into()),
+            session_id: Some("th-1".into()),
+        }],
+        "the fallback needs one user-safe terminal result without provider text: {events:?}"
+    );
+    assert!(
+        !format!("{events:?}").contains("D134_PRIVATE_PROVIDER_ERROR"),
+        "provider error leaked into the fallback event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn stalled_steer_fallback_times_out_once_and_reaps_the_child() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pid_file = temp.path().join("fallback-turn-start-pid");
+    let (stream, _steer, _token) = completed_turn_then_fallback(
+        format!("scenario:turn-start-stall|{}", pid_file.display()),
+        REAL_PROCESS_START_BOUND,
+    )
+    .await;
+    let pid = wait_for_pid_file(&pid_file, TURN_START_TEST_DEADLINE).await;
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("fallback turn/start timeout must close the stream");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("Codex stopped responding. Try again.".into()),
+            session_id: Some("th-1".into()),
+        }],
+        "the replacement turn needs exactly one terminal result: {events:?}"
+    );
+    wait_for_process_exit(pid, TURN_START_TEST_DEADLINE)
+        .await
+        .unwrap_or_else(|message| panic!("fallback turn-start fixture {message}"));
+}
+
+#[tokio::test]
+async fn cancelling_a_stalled_steer_fallback_settles_once_and_reaps_the_child() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pid_file = temp.path().join("fallback-turn-start-pid");
+    let (stream, _steer, token) = completed_turn_then_fallback(
+        format!("scenario:turn-start-stall|{}", pid_file.display()),
+        CANCELLATION_TURN_START_BOUND,
+    )
+    .await;
+    let pid = wait_for_pid_file(&pid_file, TURN_START_TEST_DEADLINE).await;
+    token.cancel();
+    let events = tokio::time::timeout(
+        TURN_START_TEST_DEADLINE,
+        stream
+            .map(|event| event.expect("normalized event"))
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("fallback interrupt must close the stream");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        }],
+        "the replacement turn needs exactly one interrupted terminal result: {events:?}"
+    );
+    wait_for_process_exit(pid, TURN_START_TEST_DEADLINE)
+        .await
+        .unwrap_or_else(|message| panic!("fallback turn-start fixture {message}"));
 }
 
 /// Runs `scenario:crash-mid-turn` until `describe_exit`'s status settles to

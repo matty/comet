@@ -1,22 +1,20 @@
 # D45 — provider lifecycle faults are scripted one at a time
 
 The fakes cover ordinary completion, protocol interruption and a process that
-wedges after a turn starts. They cannot currently express most failures around
-that path:
+wedges after a turn starts. PR #203 added six reusable Codex fault primitives:
+thread-setup stall, crash-plus-stderr, partial frame, provider death after an
+approval, duplicate completion and a completion delayed past interruption. This
+pending D134 change adds the seventh, turn-start stall. PR #217 mirrored the
+original six onto Claude. What remains unexpressed is narrower:
 
-- initialize, thread setup or turn start never answers;
-- the child exits after writing a useful stderr tail;
-- stdout closes halfway through a frame;
 - stdin breaks while Comet writes a decision or steer;
-- a response is duplicated, delayed until after cancellation or arrives among
-  unrelated notifications;
 - a provider emits a tool call and keeps the stream alive without a result.
 
 D5 added a mock-harness reproducer for the user-visible hung-tool state. It did
 not give either provider subprocess fake a way to reproduce the wire and process
 conditions that lead to it.
 
-**Why this is debt.** Each new lifecycle regression currently needs another
+**Why this is debt.** Those two remaining lifecycle regressions still need a
 custom scenario or binary, and the suite has no common invariant saying that all
 failure modes settle within a bound, emit one terminal outcome, resolve pending
 interaction and reap the child.
