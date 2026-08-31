@@ -344,3 +344,81 @@ fn a_program_under_an_existing_root_keeps_that_roots_spelling() {
         "a program under an existing root must keep that root, not gain a new one"
     );
 }
+
+/// D91's residual: the manifest must say plainly whether a Claude capture ran against an
+/// isolated `CLAUDE_CONFIG_DIR` or the capturer's ambient one, rather than leaving a reader to
+/// infer it from whether `command.configured_env` happens to carry that key.
+///
+/// `write_raw_capture`'s fixture is Claude with an empty `configured_env` -- ambient by
+/// construction, since nothing recorded `--claude-config-dir` for it.
+#[test]
+fn sanitizer_manifest_records_ambient_claude_config_isolation() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "ambient-claude-config",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "ambient-claude-config")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert_eq!(manifest["claude_config_isolation"], "ambient");
+}
+
+/// The other half: a Claude capture whose launch carried `CLAUDE_CONFIG_DIR` must be marked
+/// `"isolated"`, distinguishably from the ambient case above.
+#[test]
+fn sanitizer_manifest_records_isolated_claude_config_isolation() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "isolated-claude-config",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    // Mirrors production (`record/session.rs`'s `capture_redaction_roots`, which derives
+    // `redaction_roots.claude_config_dir` from this same `configured_env` entry): the fail-closed
+    // absolute-path scan only recognizes a value against a declared redaction root, so the two
+    // must agree here exactly as they always do coming out of a real capture.
+    capture["command"]["configured_env"]["CLAUDE_CONFIG_DIR"] =
+        Value::String(r"C:\captured-claude-config".into());
+    capture["redaction_roots"]["claude_config_dir"] =
+        Value::String(r"C:\captured-claude-config".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "isolated-claude-config")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert_eq!(manifest["claude_config_isolation"], "isolated");
+}
+
+/// The field is Claude-only: the concept has no meaning for a Codex or ACP capture, and a
+/// spurious `"ambient"` there would read as a claim about a scenario that was never in question.
+#[test]
+fn sanitizer_manifest_omits_claude_config_isolation_for_a_non_claude_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-capture",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    capture["command"]["configured_env"]["CODEX_HOME"] =
+        Value::String(r"C:\captured-codex-home".into());
+    capture["redaction_roots"]["codex_home"] = Value::String(r"C:\captured-codex-home".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-capture")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert!(
+        manifest.get("claude_config_isolation").is_none(),
+        "a non-Claude manifest must not carry a Claude-only isolation claim: {manifest}"
+    );
+}

@@ -275,7 +275,7 @@ pub fn sanitize_dir(
     let novel_paths = redactor.novel_paths();
     let escaped_paths = redactor.escaped_paths();
     let suspected_maps = redactor.suspected_maps();
-    let manifest = json!({
+    let mut manifest = json!({
         "schema_version": 1,
         "provider": capture.provider,
         "cli_version": cli_version,
@@ -286,6 +286,36 @@ pub fn sanitize_dir(
         "command": command,
         "exit_code": capture.exit_code,
     });
+    // D91's residual: `CLAUDE_CONFIG_DIR`'s presence in `command.configured_env` already IS the
+    // isolation signal, but nothing named it as one -- a reader has to know that convention to
+    // use it, and every other check in this file reads a *named* field, never "is this key
+    // missing from a generic env map." This turns that implicit fact into an explicit claim.
+    //
+    // Claude-only: the concept doesn't apply to a Codex or ACP capture, so the field is omitted
+    // there rather than given a third "not applicable" value that could be misread as either real
+    // answer. It is also omitted, by construction, from every manifest promoted before this field
+    // existed (`claude/2.1.228`, `.229`, `.233`, and the `claude/2.1.241` pair) -- absence there
+    // means the isolation state was never recorded, not that the capture was ambient. Some of
+    // those captures (`2.1.241/{model-discovery,command-discovery}`) were in fact isolated; the
+    // manifest just didn't say so under this name yet, and a reader who needs to know for one of
+    // them still has `command.configured_env` to read directly, exactly as before this field
+    // existed. See `.agents/rules/optional-wire-fields.md` on writing the absent case as
+    // "unknown," never as "not isolated."
+    if capture.provider == Provider::Claude {
+        let isolation = if capture
+            .command
+            .configured_env
+            .contains_key("CLAUDE_CONFIG_DIR")
+        {
+            "isolated"
+        } else {
+            "ambient"
+        };
+        manifest
+            .as_object_mut()
+            .expect("manifest is always built as a JSON object literal above")
+            .insert("claude_config_isolation".into(), json!(isolation));
+    }
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
     manifest_bytes.push(b'\n');
