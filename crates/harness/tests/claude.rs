@@ -638,6 +638,310 @@ async fn error_codes_map_to_readable_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// D45: reusable provider lifecycle fault primitives
+// (docs/debt/D45-provider-lifecycle-fault-matrix.md)
+//
+// PR #203 built six of these on `fake_codex.rs`. This is their `fake_claude.rs`
+// mirror — Claude's wire (stream-json over stdio, no per-turn ids, no
+// handshake distinct from the turn itself) is different enough that several
+// primitives change what they prove rather than porting one-for-one. See
+// each fixture function's own comment in `tests/fixtures/fake_claude.rs` for
+// the exact fault and how its meaning shifted.
+// ---------------------------------------------------------------------------
+
+/// D45 primitive: setup-stage stall, changed meaning (see
+/// `fake_claude.rs::silent_stall`'s doc comment for why — `ClaudeHarness` has
+/// no `startup_timeout` equivalent at all, unlike Codex).
+///
+/// A run that produces literally zero output must still be recoverable
+/// through `RunControls::interrupt` — cancelling before the CLI has said
+/// anything, not after (`interrupt_escalates_to_sigterm_and_ends_with_interrupted_done`
+/// below only proves recovery once a `SessionStarted` has already arrived).
+/// Cancelling immediately, before the child has necessarily even finished
+/// spawning, still resolves in one bounded `Done` with nothing else in the
+/// stream — proving there is no race where an early frame sneaks out before
+/// the escalation kills the child.
+///
+/// Falsified by temporarily making `silent_stall()` emit a `system`/`init`
+/// line before sleeping: the assertion below (`events` is EXACTLY one
+/// `Done`) failed with a `SessionStarted` event ahead of it, confirming the
+/// assertion is pinned on "nothing was ever heard from the provider", not
+/// merely "the run eventually ends interrupted". Restored before committing.
+#[tokio::test]
+async fn claude_silent_stall_recovers_only_via_manual_cancellation() {
+    let harness = ClaudeHarness::new()
+        .with_executable(fixture_path())
+        .with_graces(Duration::from_millis(100), Duration::from_millis(200));
+    let (controls, _steer, token) = controls("A");
+    let stream = harness
+        .run(request("scenario:silent-stall"), controls)
+        .await
+        .expect("run starts");
+    // Nothing else could ever end this run: no timeout exists to race
+    // against, so cancelling immediately (rather than waiting for some
+    // in-band signal that will never come) is the only correct way to drive
+    // this scenario at all.
+    token.cancel();
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.map(|r| r.expect("stream event")).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("cancellation must still bound a totally silent run");
+
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: None,
+        }],
+        "a silent provider must produce exactly one terminal event, nothing more: {events:?}"
+    );
+}
+
+/// D45 primitive: stderr_then_exit, mid-turn. Ported directly — same
+/// `StderrTail`/`describe_exit`/`crash_message` machinery Codex's mirror
+/// exercises, just reached through Claude's one crash-reporting call site
+/// instead of two.
+///
+/// Falsified by temporarily deleting the `writeln!(stderr, ...)` call in
+/// `crash_mid_turn()`: the assertion on `"boom: fake claude crashed
+/// mid-turn"` failed because `error` no longer contained it (`crash_message`
+/// fell back to its no-stderr form, `"claude exited unexpectedly (exit code
+/// 66)"`). Restored before committing.
+#[tokio::test]
+async fn claude_mid_turn_crash_reports_exit_code_and_a_bounded_stderr_excerpt() {
+    // `Incoming::Eof` (this fixture's stdout closing) and the OS actually
+    // marking the process exited (what `child.try_wait()` reads right after
+    // the main loop breaks) are two independent observations — the same race
+    // `crash_mid_turn_settled_error` in codex.rs documents and works around.
+    // Bounding by re-running the whole scenario, per
+    // `.agents/workflows/verify.md`'s "poll the condition with a generous
+    // deadline instead": each attempt spawns an independent process, so a
+    // retry is a fresh trial of the same race, not a re-read of stale state.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0u32;
+    let error = loop {
+        attempts += 1;
+        let (controls, _steer, _token) = controls("A");
+        let events = run_to_end(&harness(), request("scenario:crash-mid-turn"), controls).await;
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    error,
+                    ..
+                } => error.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Errored Done in {events:?}"));
+        let settled = error.contains("exit code 66");
+        if settled || tokio::time::Instant::now() >= deadline {
+            assert!(
+                settled,
+                "describe_exit never settled to \"exit code 66\" across {attempts} \
+                 attempts within a 10s deadline (last message: {error})"
+            );
+            break error;
+        }
+    };
+    assert!(
+        error.contains("boom: fake claude crashed mid-turn"),
+        "expected the bounded stderr excerpt, got: {error}"
+    );
+}
+
+/// D45 primitive: partial_line — "stdout closes halfway through a frame".
+/// Ported directly: `tokio::io::Lines` behaves the same as Codex's
+/// `BufReader::lines()` on a delimiter-less tail at EOF.
+///
+/// Falsified by temporarily completing the truncated JSON in
+/// `partial_frame_then_exit()` (closing every brace and adding the trailing
+/// newline `write!` deliberately omits): the diagnostics assertion failed
+/// with `left: [] right: [("unparseable", Malformed)]` — a real, valid
+/// `TextDelta` reached the stream instead of a diagnostic, and the run ended
+/// `Errored` (exit code 0 is still "unexpected" for a run with no `Done`
+/// frame) rather than through the diagnostic path this test exists to pin.
+/// Restored before committing.
+#[tokio::test]
+async fn claude_partial_stdout_frame_is_malformed_not_silently_dropped() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:partial-frame"), controls).await;
+
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Diagnostic {
+                discriminator,
+                severity,
+                ..
+            } => Some((discriminator.clone(), *severity)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![("unparseable".to_string(), DiagnosticSeverity::Malformed)],
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+/// D45 primitive: "stdin breaks while Comet writes a decision" — a provider
+/// that raises a `can_use_tool` request and never sticks around to see it
+/// answered. Ported directly onto Claude's control-channel shape.
+///
+/// Falsified by temporarily typo-ing the fixture's own dispatch tag
+/// (`"scenario:die-after-aproval"`, one `p`, in `fake_claude.rs`'s `main`),
+/// so the run falls through to the fixture's generic "unknown scenario"
+/// branch instead of `die_after_approval()`: `assert_ne!(error, "unknown
+/// scenario", ...)` fired with `left: "unknown scenario" right: "unknown
+/// scenario"`, proving that check is load-bearing rather than vacuous.
+/// Restored before committing.
+#[tokio::test]
+async fn claude_provider_dying_before_an_approval_decision_still_ends_bounded() {
+    let (controls, _steer, _token) = controls_with_approver(|_req: ApprovalRequest| {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(ApprovalDecision::Allow);
+        rx
+    });
+    let events = run_to_end(&harness(), request("scenario:die-after-approval"), controls).await;
+
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                error,
+                ..
+            } => error.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Errored Done in {events:?}"));
+    assert_ne!(
+        error, "unknown scenario",
+        "the fixture's die-after-approval branch never ran: {events:?}"
+    );
+    assert!(error.contains("exited unexpectedly"), "{error}");
+}
+
+/// D45 primitive: duplicate, changed meaning (see
+/// `fake_claude.rs::duplicate_completion`'s doc comment). This documents
+/// CURRENT behavior, not an aspiration — `run_session`'s main loop only ever
+/// checks `interrupted` before breaking on a `Done`, never whether a `Done`
+/// was already sent, so a second `result` frame produces a second `Done`.
+/// Fixing it needs a change in `crates/harness/src/claude/mod.rs`, out of
+/// scope for a tests-only slice; see the PR description for the proposed
+/// debt row.
+///
+/// Falsified by temporarily deleting the second `emit(r#"{"type":"result"..`
+/// call in `duplicate_completion()`: `done_count` read 1, and the
+/// `assert_eq!(done_count, 2, ...)` failed with that count, confirming the
+/// assertion is pinned on the actual duplicate rather than on any completion
+/// at all. Restored before committing.
+#[tokio::test]
+async fn claude_duplicate_result_frame_is_not_deduplicated_today() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(
+        &harness(),
+        request("scenario:duplicate-completion"),
+        controls,
+    )
+    .await;
+
+    let done_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Done { .. }))
+        .count();
+    assert_eq!(
+        done_count, 2,
+        "known gap (see this test's doc comment): expected two Done events \
+         for a duplicated result frame, got {done_count} in {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| !matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+/// D45 primitive: late_reply — "delayed until after cancellation". The
+/// provider's own successful `result` beats the interrupt to the wire's
+/// meaning, arriving after the harness already committed to
+/// `interrupted = true`.
+///
+/// Falsified by temporarily asserting `DoneStatus::Completed` here instead
+/// of `Interrupted`: failed with `left: Some(Done { status: Interrupted,
+/// .. }) right: Some(Done { status: Completed, .. })` — the fixture's own
+/// late `result: success` really does resolve through the shared
+/// `interrupted` flag rather than reporting what the frame itself claims.
+/// Restored before committing.
+#[tokio::test]
+async fn claude_completion_delayed_past_cancellation_still_reports_interrupted() {
+    let harness = ClaudeHarness::new()
+        .with_executable(fixture_path())
+        // Comfortably longer than the fixture's own 100ms delay, so the kill
+        // escalation this deliberately races against never fires.
+        .with_graces(Duration::from_secs(2), Duration::from_secs(2));
+    let (controls, _steer, token) = controls("A");
+    let mut stream = harness
+        .run(
+            request("scenario:late-completion-after-interrupt"),
+            controls,
+        )
+        .await
+        .expect("run starts");
+
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::TextDelta { text } if text == "working") {
+                token.cancel();
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run settled in time");
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("sess-late".into()),
+        }),
+        "a late-arriving completion must not overrule an already-committed \
+         interrupt: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D43: the real process-launch contract (docs/debt/D43-fake-provider-launch-contract.md)
 // ---------------------------------------------------------------------------
 
