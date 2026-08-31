@@ -1,21 +1,19 @@
-# D49 — provider subprocess tests stop at the harness boundary
+# D49 — provider subprocess coverage crosses the engine boundary
 
-The fake executables drive the Claude and Codex adapters directly. Engine tests
-exercise discovery caches and session operations through in-process harness
-doubles. No selected test starts a fake provider and carries its events through
-the harness, engine authority, RPC encoding and client-facing reply in one path.
+This was coverage debt, not a discovered runtime defect: the provider and
+engine layers already behaved correctly, but their separate tests did not prove
+the selected path end to end.
 
-**Why this is debt.** Both layers can pass independently while disagreeing about
-lifetime, interaction routing, cache invalidation or terminal state. This is most
-valuable where process behaviour matters and an in-process double cannot stand
-in for it.
+The focused Codex suite proves the selected contracts through the harness,
+engine authority and RPC. Live, paged model discovery crosses the fake
+executable → harness → engine → RPC; the explicit empty commands surface is
+asserted through the Codex harness default → engine RPC, without starting the
+fake executable. It also covers:
 
-Fix shape: add a small cross-boundary suite using injectable fake executable
-paths. Cover only contracts that have failed or cross ownership boundaries:
-model/command discovery, one approval decision, resume/fallback, cancellation,
-and the final terminal state. Claude attachments are a candidate once D43 gives
-the fake a launch/input assertion for them.
+- native rejected-resume fallback to a fresh durable session;
+- deny-and-interrupt approval through RPC transcript delivery; and
+- durable journal, session, and document terminal state.
 
-Do not duplicate every harness transcript through the engine and UI. Most frame
-normalization belongs in the existing harness suites; the cross-boundary tests
-should prove wiring and authority, not become a second provider protocol suite.
+The scope stays deliberately narrow. Protocol frame matrices remain
+harness-owned, and Claude attachments remain D43-owned. This is wiring and
+authority coverage, not a second provider protocol suite.
