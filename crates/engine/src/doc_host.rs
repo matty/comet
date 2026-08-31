@@ -70,6 +70,15 @@ struct DocHostInner {
     purge_gate: Mutex<PurgeGate>,
     #[cfg(test)]
     purges: watch::Sender<u64>,
+    #[cfg(test)]
+    command_drain_pause: Mutex<Option<CommandDrainPause>>,
+}
+
+#[cfg(test)]
+struct CommandDrainPause {
+    chat_id: String,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Identity for one deletion or reconciliation lifecycle. Tokens are
@@ -348,6 +357,8 @@ impl DocHost {
                 }),
                 #[cfg(test)]
                 purges,
+                #[cfg(test)]
+                command_drain_pause: Mutex::new(None),
             }),
         }
     }
@@ -548,6 +559,41 @@ impl DocHost {
         self.inner.purges.subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_command_drain_for_test(
+        &self,
+        chat_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut slot = lock(&self.inner.command_drain_pause);
+        assert!(slot.is_none(), "only one command drain pause may be armed");
+        *slot = Some(CommandDrainPause {
+            chat_id: chat_id.to_string(),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_command_drain_if_requested(&self, chat_id: &str) {
+        let pause = {
+            let mut slot = lock(&self.inner.command_drain_pause);
+            if slot.as_ref().is_some_and(|pause| pause.chat_id == chat_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(pause) = pause else { return };
+        let _ = pause.reached.send(());
+        let _ = pause.release.await;
+    }
+
     /// Read an exact tool-result source pair when its durable reference still matches.
     #[allow(dead_code)] // Consumed by the following read-only RPC task.
     pub(crate) fn read_tool_diff(
@@ -638,6 +684,40 @@ impl DocHost {
         let registered = register(run_doc);
         drop(gate);
         Ok(registered)
+    }
+
+    /// Run one synchronous effect only while `handle` is still the mapped
+    /// document generation for its chat id. The lifecycle lock stays held
+    /// through the effect, so deletion cannot pass the check and admit a
+    /// same-id successor before the effect finishes.
+    pub(crate) fn with_current_handle<T>(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = lock(&self.inner.purge_gate);
+        if gate.chats.contains_key(&handle.chat_id) {
+            return None;
+        }
+        let current = lock(&self.inner.handles)
+            .get(&handle.chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if !current {
+            return None;
+        }
+        let result = effect();
+        drop(gate);
+        Some(result)
+    }
+
+    pub(crate) fn is_current_handle(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        self.with_current_handle(handle, || ()).is_some()
+    }
+
+    fn ensure_current_handle(&self, handle: &Arc<ChatDocHandle>) -> Result<(), EngineError> {
+        self.is_current_handle(handle)
+            .then_some(())
+            .ok_or(EngineError::ChatCleanupPendingRetry)
     }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
@@ -984,9 +1064,17 @@ impl DocHost {
         if !self.is_host(&handle.chat_id) {
             return;
         }
+        #[cfg(test)]
+        self.pause_command_drain_if_requested(&handle.chat_id).await;
+        if !self.is_current_handle(handle) {
+            return;
+        }
         // Entries this pass decided to leave alone (processed dedupe hits).
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
+            if !self.is_current_handle(handle) {
+                return;
+            }
             let commands = match handle.doc.read_commands() {
                 Ok(commands) => commands,
                 Err(err) => {
@@ -1021,7 +1109,12 @@ impl DocHost {
             );
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
+            let Some(marked) =
+                self.with_current_handle(handle, || self.inner.store.mark_processed(&entry.id))
+            else {
+                return;
+            };
+            if let Err(err) = marked {
                 tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
                 return;
             }
@@ -1040,6 +1133,9 @@ impl DocHost {
                         Ok(outcome) => outcome,
                         Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                     };
+                    if !self.is_current_handle(handle) {
+                        return;
+                    }
                     self.resolve_command(handle, &entry.id, status, resolution.as_deref());
                 }
             }
@@ -1049,15 +1145,19 @@ impl DocHost {
     /// Host-only outcome write (ledger rule 2).
     fn resolve_command(
         &self,
-        handle: &ChatDocHandle,
+        handle: &Arc<ChatDocHandle>,
         command_id: &str,
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) {
-        if let Err(err) = handle
-            .doc
-            .set_command_status(command_id, status, resolution)
-        {
+        let Some(result) = self.with_current_handle(handle, || {
+            handle
+                .doc
+                .set_command_status(command_id, status, resolution)
+        }) else {
+            return;
+        };
+        if let Err(err) = result {
             tracing::warn!(
                 chat = %handle.chat_id,
                 command = %command_id,
@@ -1074,6 +1174,7 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        self.ensure_current_handle(handle)?;
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -1082,7 +1183,12 @@ impl DocHost {
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
-                    ws.claim_chat(chat_id, Some(&request.cwd))?;
+                    let Some(claimed) = self
+                        .with_current_handle(handle, || ws.claim_chat(chat_id, Some(&request.cwd)))
+                    else {
+                        return Err(EngineError::ChatCleanupPendingRetry);
+                    };
+                    claimed?;
                 }
                 let harness = self.harness_for_request(chat_id, request);
                 // The owner persists what it is about to dispatch so the row
@@ -1099,16 +1205,29 @@ impl DocHost {
                         sandbox: request.sandbox,
                         runtime_mode: request.runtime_mode,
                     };
-                    if let Err(err) = ws.set_chat_config(chat_id, &config) {
+                    let Some(written) =
+                        self.with_current_handle(handle, || ws.set_chat_config(chat_id, &config))
+                    else {
+                        return Err(EngineError::ChatCleanupPendingRetry);
+                    };
+                    if let Err(err) = written {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
                 }
+                self.ensure_current_handle(handle)?;
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch_for_generation(
+                        handle,
+                        harness,
+                        request.clone(),
+                        Some(message_id.clone()),
+                    )
                     .await?;
+                self.ensure_current_handle(handle)?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
+                self.ensure_current_handle(handle)?;
                 match sessions.steer(chat_id, prompt, message_id.clone()).await? {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
                     SteerOutcome::NotSteerable => {
@@ -1139,9 +1258,11 @@ impl DocHost {
                         // ride the prompt text.
                         request.attachments = Vec::new();
                         let harness = self.harness_for_request(chat_id, &request);
+                        self.ensure_current_handle(handle)?;
                         sessions
-                            .dispatch(chat_id, harness, request, message_id.clone())
+                            .dispatch_for_generation(handle, harness, request, message_id.clone())
                             .await?;
+                        self.ensure_current_handle(handle)?;
                         Ok((
                             SessionCommandStatus::Applied,
                             Some("queued as new turn".into()),
@@ -1150,14 +1271,21 @@ impl DocHost {
                 }
             }
             SessionCommandPayload::Interrupt {} => {
-                sessions.interrupt(chat_id).await?;
+                self.ensure_current_handle(handle)?;
+                sessions.interrupt_for_generation(handle).await?;
+                self.ensure_current_handle(handle)?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondInput {
                 request_id,
                 answers,
             } => {
-                if sessions.respond_input(chat_id, request_id, answers.clone())? {
+                let Some(responded) = self.with_current_handle(handle, || {
+                    sessions.respond_input(chat_id, request_id, answers.clone())
+                }) else {
+                    return Err(EngineError::ChatCleanupPendingRetry);
+                };
+                if responded? {
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver. Only a request id the doc shows as an
@@ -1211,12 +1339,21 @@ impl DocHost {
                 self.apply_chat_row_runtime_mode(chat_id, &mut request);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                if let Err(err) = handle.doc.resolve_input(request_id) {
+                let Some(resolved) =
+                    self.with_current_handle(handle, || handle.doc.resolve_input(request_id))
+                else {
+                    return Err(EngineError::ChatCleanupPendingRetry);
+                };
+                if let Err(err) = resolved {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
                 let harness = self.harness_for_request(chat_id, &request);
-                sessions.dispatch(chat_id, harness, request, None).await?;
+                self.ensure_current_handle(handle)?;
+                sessions
+                    .dispatch_for_generation(handle, harness, request, None)
+                    .await?;
+                self.ensure_current_handle(handle)?;
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
@@ -1236,7 +1373,12 @@ impl DocHost {
                         Some("Expired isn't a decision that can be sent.".into()),
                     ));
                 }
-                if sessions.respond_approval(chat_id, request_id, decision.clone())? {
+                let Some(responded) = self.with_current_handle(handle, || {
+                    sessions.respond_approval(chat_id, request_id, decision.clone())
+                }) else {
+                    return Err(EngineError::ChatCleanupPendingRetry);
+                };
+                if responded? {
                     return Ok((SessionCommandStatus::Applied, None));
                 }
                 // No live resolver, and no fallback is possible: the decision

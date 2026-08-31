@@ -226,6 +226,7 @@ impl EngineCore {
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
+            doc_host.clone(),
             registry.clone(),
             repos.clone(),
         ));

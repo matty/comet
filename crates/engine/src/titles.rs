@@ -40,6 +40,7 @@ use comet_proto::{
 };
 
 use crate::EngineError;
+use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
@@ -50,6 +51,7 @@ const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
     workspace: WorkspaceHost,
+    doc_host: DocHost,
     registry: Arc<HarnessRegistry>,
     repos: Repos,
 }
@@ -74,10 +76,14 @@ impl Inner {
     /// and nothing forced the two orderings to agree until this fix.
     async fn rename_worktree_branch_for_title(
         &self,
-        chat_id: &str,
+        generation: &Arc<ChatDocHandle>,
         chat: &comet_proto::Chat,
         title: &str,
     ) {
+        if !self.doc_host.is_current_handle(generation) {
+            return;
+        }
+        let chat_id = generation.chat_id();
         let (Some(chat_cwd), Some(branch)) = (&chat.cwd, &chat.branch) else {
             return;
         };
@@ -90,7 +96,12 @@ impl Inner {
             .await
         {
             Ok(renamed) if &renamed != branch => {
-                if let Err(err) = self.workspace.set_chat_branch(chat_id, &renamed) {
+                let Some(updated) = self.doc_host.with_current_handle(generation, || {
+                    self.workspace.set_chat_branch(chat_id, &renamed)
+                }) else {
+                    return;
+                };
+                if let Err(err) = updated {
                     tracing::warn!(chat = %chat_id, error = %err, "chat branch update failed");
                 }
             }
@@ -108,10 +119,16 @@ pub struct TitleGenerator {
 }
 
 impl TitleGenerator {
-    pub fn new(workspace: WorkspaceHost, registry: Arc<HarnessRegistry>, repos: Repos) -> Self {
+    pub fn new(
+        workspace: WorkspaceHost,
+        doc_host: DocHost,
+        registry: Arc<HarnessRegistry>,
+        repos: Repos,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 workspace,
+                doc_host,
                 registry,
                 repos,
             }),
@@ -125,14 +142,19 @@ impl TitleGenerator {
     /// exactly why it stays unconditional: see [`Self::maybe_generate_upfront`]'s
     /// doc for the request-start site this is NOT, and the policy that splits
     /// them.
-    pub fn maybe_generate(&self, chat_id: &str, harness: HarnessId, prompt: &str, cwd: &str) {
+    pub fn maybe_generate(
+        &self,
+        generation: Arc<ChatDocHandle>,
+        harness: HarnessId,
+        prompt: &str,
+        cwd: &str,
+    ) {
         let this = self.clone();
-        let chat_id = chat_id.to_string();
         let prompt = prompt.to_string();
         let cwd = cwd.to_string();
         tokio::spawn(async move {
-            if let Err(err) = this.generate(&chat_id, harness, &prompt, &cwd).await {
-                tracing::debug!(chat = %chat_id, error = %err, "chat auto-titling skipped");
+            if let Err(err) = this.generate(&generation, harness, &prompt, &cwd).await {
+                tracing::debug!(chat = %generation.chat_id(), error = %err, "chat auto-titling skipped");
             }
         });
     }
@@ -166,7 +188,7 @@ impl TitleGenerator {
     /// always safe (first-writer-wins refuses whichever side loses).
     pub fn maybe_generate_upfront(
         &self,
-        chat_id: &str,
+        generation: Arc<ChatDocHandle>,
         harness: HarnessId,
         prompt: &str,
         cwd: &str,
@@ -174,7 +196,7 @@ impl TitleGenerator {
         if harness_self_titles(&self.inner.registry, harness) {
             return;
         }
-        self.maybe_generate(chat_id, harness, prompt, cwd);
+        self.maybe_generate(generation, harness, prompt, cwd);
     }
 
     /// Apply a title the agent generated itself
@@ -209,11 +231,12 @@ impl TitleGenerator {
     /// event stream this method is called from, and its own timing has no
     /// bearing on the race described above (nothing reads the branch name to
     /// decide whether a titling run would be wasted).
-    pub fn apply_agent_title(&self, chat_id: &str, title: &str) {
+    pub fn apply_agent_title(&self, generation: Arc<ChatDocHandle>, title: &str) {
         let title = title.trim();
         if title.is_empty() {
             return;
         }
+        let chat_id = generation.chat_id();
         // Read first (for the branch-rename step below, which needs cwd and
         // the CURRENT branch): rename_chat_auto does not change either field,
         // so a value read just before the write is never stale for that.
@@ -225,7 +248,12 @@ impl TitleGenerator {
                 return;
             }
         };
-        let title_landed = match self.inner.workspace.rename_chat_auto(chat_id, title) {
+        let Some(title_write) = self.inner.doc_host.with_current_handle(&generation, || {
+            self.inner.workspace.rename_chat_auto(chat_id, title)
+        }) else {
+            return;
+        };
+        let title_landed = match title_write {
             Ok(true) => {
                 tracing::info!(chat = %chat_id, %title, "chat named by agent");
                 true
@@ -240,32 +268,37 @@ impl TitleGenerator {
             return;
         }
         let this = self.inner.clone();
-        let chat_id = chat_id.to_string();
         let title = title.to_string();
         tokio::spawn(async move {
-            this.rename_worktree_branch_for_title(&chat_id, &chat, &title)
+            this.rename_worktree_branch_for_title(&generation, &chat, &title)
                 .await;
         });
     }
 
     async fn generate(
         &self,
-        chat_id: &str,
+        generation: &Arc<ChatDocHandle>,
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
     ) -> Result<(), EngineError> {
-        let chat = self
+        let chat_id = generation.chat_id();
+        let Some(chat_result) = self
             .inner
-            .workspace
-            .doc()
-            .chat(chat_id)?
-            .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
+            .doc_host
+            .with_current_handle(generation, || self.inner.workspace.doc().chat(chat_id))
+        else {
+            return Ok(());
+        };
+        let chat =
+            chat_result?.ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
         if already_named(&chat) {
             return Ok(());
         }
 
-        let generated = self.run_title_model(harness_id, prompt, cwd).await;
+        let generated = self
+            .run_title_model(generation, harness_id, prompt, cwd)
+            .await;
         // Fallback so a chat is always named even if the model run produced nothing.
         let fallback: String = prompt
             .split_whitespace()
@@ -283,7 +316,14 @@ impl TitleGenerator {
         // Re-read after the model call: a user may have named the chat (or an
         // agent self-titled it, or checked out another branch) while the
         // throwaway generation was live.
-        let latest = self.inner.workspace.doc().chat(chat_id)?.unwrap_or(chat);
+        let Some(latest_result) = self
+            .inner
+            .doc_host
+            .with_current_handle(generation, || self.inner.workspace.doc().chat(chat_id))
+        else {
+            return Ok(());
+        };
+        let latest = latest_result?.unwrap_or(chat);
         if already_named(&latest) {
             return Ok(());
         }
@@ -300,7 +340,12 @@ impl TitleGenerator {
         // first-writer-wins race between the re-read above and this write
         // must never leave the branch renamed for a title the chat never
         // shows.
-        if !self.inner.workspace.rename_chat_auto(chat_id, &title)? {
+        let Some(title_write) = self.inner.doc_host.with_current_handle(generation, || {
+            self.inner.workspace.rename_chat_auto(chat_id, &title)
+        }) else {
+            return Ok(());
+        };
+        if !title_write? {
             return Ok(());
         }
         tracing::info!(chat = %chat_id, title = %title, "chat auto-titled");
@@ -311,7 +356,7 @@ impl TitleGenerator {
         // behavior for a self-titling agent's title — see
         // `rename_worktree_branch_for_title`'s own doc.
         self.inner
-            .rename_worktree_branch_for_title(chat_id, &latest, &title)
+            .rename_worktree_branch_for_title(generation, &latest, &title)
             .await;
         Ok(())
     }
@@ -319,10 +364,14 @@ impl TitleGenerator {
     /// One-shot titling run: collect TextDeltas until Done; retries on failure.
     async fn run_title_model(
         &self,
+        generation: &Arc<ChatDocHandle>,
         harness_id: HarnessId,
         prompt: &str,
         cwd: &str,
     ) -> Option<String> {
+        if !self.inner.doc_host.is_current_handle(generation) {
+            return None;
+        }
         let harness = match self.inner.registry.resolve(harness_id) {
             Ok(harness) => harness,
             Err(err) => {
@@ -337,14 +386,23 @@ impl TitleGenerator {
                 .map(|catalog| catalog.models)
                 .unwrap_or_default(),
         );
+        if !self.inner.doc_host.is_current_handle(generation) {
+            return None;
+        }
         let title_prompt = format!(
             "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
              for a coding session that begins with this request:\n\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
+            if !self.inner.doc_host.is_current_handle(generation) {
+                return None;
+            }
             let request = title_request(harness_id, cheap.clone(), cwd, title_prompt.clone());
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {
+                    if !self.inner.doc_host.is_current_handle(generation) {
+                        return None;
+                    }
                     let candidate = clean_title(&raw);
                     if !candidate.is_empty() {
                         return Some(candidate);
@@ -675,14 +733,20 @@ mod tests {
             .create_chat("chat-mock", "space-1", None, None)
             .unwrap();
 
-        let titles =
-            TitleGenerator::new(core.workspace.clone(), registry.clone(), core.repos.clone());
+        let titles = TitleGenerator::new(
+            core.workspace.clone(),
+            core.doc_host.clone(),
+            registry.clone(),
+            core.repos.clone(),
+        );
+        let grok_generation = core.doc_host.open("chat-grok").unwrap();
+        let mock_generation = core.doc_host.open("chat-mock").unwrap();
 
         // Self-titling harness: the dispatch must be a synchronous no-op —
         // nothing spawned, so nothing left to race. A couple of yields flush
         // any task that WOULD have been spawned if the gate were broken.
         titles.maybe_generate_upfront(
-            "chat-grok",
+            grok_generation,
             HarnessId::Grok,
             "name this chat",
             dir.path().to_str().unwrap(),
@@ -710,7 +774,7 @@ mod tests {
         // self-titling, does dispatch — proving the negative result above is
         // the gate, not a broken dispatch mechanism.
         titles.maybe_generate_upfront(
-            "chat-mock",
+            mock_generation,
             HarnessId::Mock,
             "name this chat",
             dir.path().to_str().unwrap(),
@@ -752,10 +816,15 @@ mod tests {
         core.workspace
             .create_chat("chat-1", "space-1", None, None)
             .unwrap();
-        let titles =
-            TitleGenerator::new(core.workspace.clone(), registry.clone(), core.repos.clone());
+        let titles = TitleGenerator::new(
+            core.workspace.clone(),
+            core.doc_host.clone(),
+            registry.clone(),
+            core.repos.clone(),
+        );
+        let generation = core.doc_host.open("chat-1").unwrap();
 
-        titles.apply_agent_title("chat-1", "  Fix Login Flow  ");
+        titles.apply_agent_title(generation.clone(), "  Fix Login Flow  ");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if core
@@ -790,7 +859,7 @@ mod tests {
         // A person renames it by hand afterward — a later agent title event
         // (Grok re-pushing a revision) must not land over it.
         core.workspace.rename_chat("chat-1", "User Title").unwrap();
-        titles.apply_agent_title("chat-1", "Agent Retitle");
+        titles.apply_agent_title(generation, "Agent Retitle");
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
