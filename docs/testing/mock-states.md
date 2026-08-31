@@ -24,10 +24,6 @@ now answer one when you make it (D99), which is what puts a steer-boundary state
 
 ## Running the app against them
 
-**The mock harness is registered in debug builds only.** `default_registry()` gates it behind
-`debug_assertions`, so `COMET_HARNESS=mock` against a `--release` binary silently gets no mock
-and no error — the picker just has no Mock row. Build unoptimized, as below.
-
 ```powershell
 $env:COMET_HARNESS = "mock"
 $env:COMET_MOCK_SUBAGENT = "1"

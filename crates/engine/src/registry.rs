@@ -1,4 +1,4 @@
-//! HarnessRegistry — the engine's harness catalog: the debug-only eager mock plus lazy
+//! HarnessRegistry — the engine's harness catalog: eager instances (mock) plus lazy
 //! slots resolved on first use (claude-code spawns subprocess discovery; codex/cursor
 //! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
 
@@ -7,12 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(debug_assertions)]
-use comet_harness::mock::MockHarness;
-use comet_harness::{Harness, HarnessError};
+use comet_harness::{Harness, HarnessError, mock::MockHarness};
 use comet_proto::{
-    DiagnosticSeverity, HarnessAvailability, HarnessCapabilities, HarnessId, HarnessInstall,
-    HarnessProbe, HarnessUpdate, sanitize_discriminator,
+    AgentEvent, DiagnosticSeverity, DoneStatus, HarnessAvailability, HarnessCapabilities,
+    HarnessId, HarnessInstall, HarnessProbe, HarnessUpdate, sanitize_discriminator,
 };
 
 /// What `ListHarnesses` reports per harness.
@@ -367,22 +365,65 @@ impl HarnessRegistry {
     }
 }
 
-/// The production registry: the lazy `claude-code`/`codex`/`grok`/`hermes` slots, plus
-/// the scripted mock in debug builds only. Each lazy slot resolves through
-/// `comet_harness` on first use, so subprocess discovery only happens when a
-/// run/model call actually needs it.
+/// The production registry: MockHarness (hidden from production pickers) plus a lazy
+/// `claude-code` slot resolved through `comet_harness` on first use (subprocess
+/// discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     comet_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
-    // Dev-only. The mock is a scripted demo harness, not a product surface:
-    // the UI already hides it unless `COMET_HARNESS=mock` (see
-    // `pickers::visible_harnesses`), so a release build has no way to reach it
-    // and no reason to carry its script. Debug covers every rig that wants it —
-    // `scripts/e2e-smoke.sh` and `scripts/dev-demo.sh` both build unoptimized.
-    #[cfg(debug_assertions)]
-    register_mock(&registry);
+    registry.register(Arc::new(MockHarness::with_script(vec![
+            AgentEvent::TextDelta {
+                text: "## Streaming pipeline\n\nEvery turn flows through the same path:\n\n".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "1. **Doc command** — the composer queues a durable `run` entry\n2. **Host executor** — the chat's host device marks it processed, then dispatches\n3. **Fold** — events fold into parts and diff into the Loro doc every 120ms\n\n".into(),
+            },
+            AgentEvent::ToolCall {
+                id: "mock-tool-1".into(),
+                call: comet_proto::ToolCall::Exec {
+                    command: "cargo test --workspace".into(),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "mock-tool-1".into(),
+                is_error: false,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
+            },
+            AgentEvent::ToolCall {
+                id: "mock-tool-2".into(),
+                call: comet_proto::ToolCall::Exec {
+                    command: "git log -5 --oneline --decorate && git merge-base HEAD origin/main"
+                        .into(),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "mock-tool-2".into(),
+                is_error: false,
+                diff: None,
+                diff_ref: None,
+                diff_stats: None,
+            },
+            AgentEvent::Notice {
+                kind: comet_proto::NoticeKind::Compaction,
+                severity: comet_proto::NoticeSeverity::Info,
+                summary: "Context compacted automatically".into(),
+                detail: Some("41,000 tokens → 9,500".into()),
+                key: Some("compaction".into()),
+            },
+            AgentEvent::TextDelta {
+                text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            },
+        ])));
     // The lazy descriptors name the harness's own `capabilities()`, so the
     // catalog entry `ListHarnesses` reports before first use is the same value
     // `describe()` produces after the slot resolves. CLI discovery still only
@@ -440,68 +481,6 @@ pub fn default_registry() -> HarnessRegistry {
     registry
 }
 
-/// The scripted demo harness. Registered first so it heads the picker order
-/// under `COMET_HARNESS=mock`.
-#[cfg(debug_assertions)]
-fn register_mock(registry: &HarnessRegistry) {
-    // Scoped here rather than at the top of the file: nothing outside this
-    // debug-only script names them, so a release build would carry two unused
-    // imports.
-    use comet_proto::{AgentEvent, DoneStatus};
-
-    registry.register(Arc::new(MockHarness::with_script(vec![
-            AgentEvent::TextDelta {
-                text: "## Streaming pipeline\n\nEvery turn flows through the same path:\n\n".into(),
-            },
-            AgentEvent::TextDelta {
-                text: "1. **Doc command** — the composer queues a durable `run` entry\n2. **Host executor** — the chat's host device marks it processed, then dispatches\n3. **Fold** — events fold into parts and diff into the Loro doc every 120ms\n\n".into(),
-            },
-            AgentEvent::ToolCall {
-                id: "mock-tool-1".into(),
-                call: comet_proto::ToolCall::Exec {
-                    command: "cargo test --workspace".into(),
-                },
-            },
-            AgentEvent::ToolResult {
-                id: "mock-tool-1".into(),
-                is_error: false,
-                diff: None,
-                diff_ref: None,
-                diff_stats: None,
-            },
-            AgentEvent::ToolCall {
-                id: "mock-tool-2".into(),
-                call: comet_proto::ToolCall::Exec {
-                    command: "git log -5 --oneline --decorate && git merge-base HEAD origin/main"
-                        .into(),
-                },
-            },
-            AgentEvent::ToolResult {
-                id: "mock-tool-2".into(),
-                is_error: false,
-                diff: None,
-                diff_ref: None,
-                diff_stats: None,
-            },
-            AgentEvent::Notice {
-                kind: comet_proto::NoticeKind::Compaction,
-                severity: comet_proto::NoticeSeverity::Info,
-                summary: "Context compacted automatically".into(),
-                detail: Some("41,000 tokens → 9,500".into()),
-                key: Some("compaction".into()),
-            },
-            AgentEvent::TextDelta {
-                text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
-            },
-            AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: None,
-                error: None,
-                session_id: None,
-            },
-        ])));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,22 +524,17 @@ mod tests {
     fn default_registry_lists_every_slot_in_picker_order() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
-        // The mock heads the order in debug builds and is absent from release
-        // ones — asserted both ways so the gate itself cannot rot unnoticed.
-        let mut expected = vec![
-            HarnessId::ClaudeCode,
-            HarnessId::Codex,
-            HarnessId::Grok,
-            HarnessId::Hermes,
-        ];
-        if cfg!(debug_assertions) {
-            expected.insert(0, HarnessId::Mock);
-        }
-        assert_eq!(ids, expected);
         assert_eq!(
-            registry.resolve(HarnessId::Mock).is_ok(),
-            cfg!(debug_assertions)
+            ids,
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Grok,
+                HarnessId::Hermes,
+            ]
         );
+        assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
         // Resolving answers the right harness (construction is cheap; CLI
         // discovery is deferred to models()/run()).
