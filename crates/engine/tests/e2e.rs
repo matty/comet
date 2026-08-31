@@ -4786,6 +4786,7 @@ async fn a_discovered_model_reaches_the_client_and_the_list_reads_live() {
             }),
             reasoning_levels: vec![ReasoningLevel::High],
             default_reasoning: Some(ReasoningLevel::Low),
+            service_tier_available: None,
             accepts_images: None,
         }],
     })

@@ -76,6 +76,12 @@ use serde::{Deserialize, Serialize};
 /// require a bump. A new peer decoding an older model list gets `None` and
 /// retains the existing ladder heuristic; an older peer ignores the unknown
 /// key and retains that same heuristic. It never overrides a user selection.
+///
+/// D37: live service-tier availability does NOT require a bump. It is decoded
+/// only inside the harness and removes an item from the existing
+/// `Model.options` list; no wire field or enum variant changes. Older peers
+/// already treat that list's contents as catalog data and simply receive the
+/// same model with no unavailable option.
 pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

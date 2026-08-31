@@ -330,9 +330,8 @@ struct ModelListResult {
 }
 
 /// Only the fields Comet consumes. The reply carries several more —
-/// `serviceTiers`, `supportsPersonality`, `availabilityNux`,
-/// `modelSpecialty` and the rest — still deliberately unmodelled;
-/// see their debt rows.
+/// `supportsPersonality`, `availabilityNux`, `modelSpecialty` and the
+/// rest — still deliberately unmodelled; see their debt rows.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListedModel {
@@ -357,6 +356,13 @@ struct ListedModel {
     /// Comet level. The picker falls back to its established heuristic.
     #[serde(default)]
     default_reasoning_effort: Option<String>,
+    /// Missing is unknown and preserves Comet's curated fallback. An explicit
+    /// empty list is authoritative for this model (D37). The objects' contents
+    /// are intentionally ignored: the separate `additionalSpeedTiers` field
+    /// carries the request value (`fast`), while this list is the capability
+    /// gate this slice needs.
+    #[serde(default)]
+    service_tiers: Option<Vec<serde::de::IgnoredAny>>,
     /// Absent means `["text","image"]`, not "unknown" — the schema documents
     /// the default (`schema.gen.ts:22253`). See
     /// `.agents/rules/optional-wire-fields.md`.
@@ -472,6 +478,7 @@ pub(crate) fn page_from_reply(line: &str) -> Result<ModelPage, DiscoveryFailure>
                     .filter_map(|effort| to_level(&effort.reasoning_effort))
                     .collect(),
                 default_reasoning: model.default_reasoning_effort.as_deref().and_then(to_level),
+                service_tier_available: model.service_tiers.map(|tiers| !tiers.is_empty()),
                 accepts_images: Some(match model.input_modalities {
                     Some(modalities) => modalities.iter().any(|m| m == "image"),
                     // The documented default, written by hand because no live model
@@ -646,6 +653,29 @@ mod tests {
         let (models, _, _) =
             page_from_reply(line).expect("unknown values do not invalidate discovery");
         assert_eq!(models[0].default_reasoning, None);
+    }
+
+    #[test]
+    fn captured_service_tier_availability_distinguishes_nonempty_and_empty_lists() {
+        let payload = corpus_frame(MODEL_DISCOVERY, 6).payload;
+        let (models, _, _) = page_from_reply(&payload).expect("decodes");
+
+        let supports_tier = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.service_tier_available)
+        };
+        assert_eq!(supports_tier("gpt-5.6-sol"), Some(true));
+        assert_eq!(supports_tier("gpt-5.4-mini"), Some(false));
+        assert_eq!(supports_tier("gpt-5.3-codex-spark"), Some(false));
+    }
+
+    #[test]
+    fn absent_service_tiers_stays_unknown() {
+        let line = r#"{"id":2,"result":{"data":[{"id":"future","displayName":"Future","hidden":false,"supportedReasoningEfforts":[]}],"nextCursor":null}}"#;
+        let (models, _, _) = page_from_reply(line).expect("decodes");
+        assert_eq!(models[0].service_tier_available, None);
     }
 
     /// The field 2.4's modality gate reads, and the one place the live answer

@@ -209,6 +209,7 @@ fn models_from_discovery(discovered: &Discovered) -> Discovery {
                     // surface -- see `HermesHarness::capabilities()`.
                     reasoning_levels: Vec::new(),
                     default_reasoning: None,
+                    service_tier_available: None,
                     accepts_images: image_support,
                     id,
                 })
