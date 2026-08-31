@@ -4,10 +4,12 @@ This was coverage debt, not a discovered runtime defect: the provider and
 engine layers already behaved correctly, but their separate tests did not prove
 the selected path end to end.
 
-The focused Codex suite now starts the fake executable and carries the selected
-contracts through the harness, engine authority and RPC. It covers:
+The focused Codex suite proves the selected contracts through the harness,
+engine authority and RPC. Live, paged model discovery crosses the fake
+executable → harness → engine → RPC; the explicit empty commands surface is
+asserted through the Codex harness default → engine RPC, without starting the
+fake executable. It also covers:
 
-- live, paged Codex model discovery and the explicit empty commands endpoint;
 - native rejected-resume fallback to a fresh durable session;
 - deny-and-interrupt approval through RPC transcript delivery; and
 - durable journal, session, and document terminal state.
