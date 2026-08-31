@@ -344,3 +344,90 @@ fn a_program_under_an_existing_root_keeps_that_roots_spelling() {
         "a program under an existing root must keep that root, not gain a new one"
     );
 }
+
+/// D91's residual: the manifest must say plainly whether a Claude capture's launch was
+/// configured with an isolated `CLAUDE_CONFIG_DIR`, rather than leaving a reader to infer it from
+/// whether `command.configured_env` happens to carry that key.
+///
+/// Deliberately NOT named "ambient": `write_raw_capture`'s fixture has an empty `configured_env`,
+/// meaning the rig did not pass `--claude-config-dir` -- but the rig cannot see whether the
+/// spawned child inherited an ambient `CLAUDE_CONFIG_DIR` from the capturer's own shell
+/// (`LaunchDescriptor::spawn` never calls `.env_clear()`). Calling this case "ambient" would be a
+/// claim the evidence doesn't support; "unknown" is the honest one. See the production comment
+/// beside `claude_config_isolation` in `sanitize.rs` for the full reasoning.
+#[test]
+fn sanitizer_manifest_records_unknown_claude_config_isolation_when_unconfigured() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "unconfigured-claude-config",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+
+    let report = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "unconfigured-claude-config"),
+    )
+    .unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert_eq!(manifest["claude_config_isolation"], "unknown");
+}
+
+/// The other half: a Claude capture whose launch carried `CLAUDE_CONFIG_DIR` must be marked
+/// `"isolated"`, distinguishably from the unknown case above -- this is the one case the rig can
+/// vouch for with certainty, since it set the variable itself.
+#[test]
+fn sanitizer_manifest_records_isolated_claude_config_isolation() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "isolated-claude-config",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    // Mirrors production (`record/session.rs`'s `capture_redaction_roots`, which derives
+    // `redaction_roots.claude_config_dir` from this same `configured_env` entry): the fail-closed
+    // absolute-path scan only recognizes a value against a declared redaction root, so the two
+    // must agree here exactly as they always do coming out of a real capture.
+    capture["command"]["configured_env"]["CLAUDE_CONFIG_DIR"] =
+        Value::String(r"C:\captured-claude-config".into());
+    capture["redaction_roots"]["claude_config_dir"] =
+        Value::String(r"C:\captured-claude-config".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "isolated-claude-config")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert_eq!(manifest["claude_config_isolation"], "isolated");
+}
+
+/// The field is Claude-only: the concept has no meaning for a Codex or ACP capture, and a
+/// spurious `"unknown"` there would read as a claim about a scenario that was never in question.
+#[test]
+fn sanitizer_manifest_omits_claude_config_isolation_for_a_non_claude_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "codex-capture",
+        &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
+    );
+    let capture_path = raw.join("capture.json");
+    let mut capture: Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    capture["provider"] = Value::String("codex".into());
+    capture["command"]["configured_env"]["CODEX_HOME"] =
+        Value::String(r"C:\captured-codex-home".into());
+    capture["redaction_roots"]["codex_home"] = Value::String(r"C:\captured-codex-home".into());
+    std::fs::write(&capture_path, serde_json::to_vec_pretty(&capture).unwrap()).unwrap();
+
+    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "codex-capture")).unwrap();
+    let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
+
+    assert!(
+        manifest.get("claude_config_isolation").is_none(),
+        "a non-Claude manifest must not carry a Claude-only isolation claim: {manifest}"
+    );
+}

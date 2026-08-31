@@ -275,7 +275,7 @@ pub fn sanitize_dir(
     let novel_paths = redactor.novel_paths();
     let escaped_paths = redactor.escaped_paths();
     let suspected_maps = redactor.suspected_maps();
-    let manifest = json!({
+    let mut manifest = json!({
         "schema_version": 1,
         "provider": capture.provider,
         "cli_version": cli_version,
@@ -286,6 +286,50 @@ pub fn sanitize_dir(
         "command": command,
         "exit_code": capture.exit_code,
     });
+    // D91's residual: `CLAUDE_CONFIG_DIR`'s presence in `command.configured_env` already IS a
+    // deliberate-isolation signal, but nothing named it as one -- a reader has to know that
+    // convention to use it, and every other check in this file reads a *named* field, never "is
+    // this key missing from a generic env map." This turns that implicit fact into an explicit
+    // claim, but ONLY in the direction the rig can actually vouch for.
+    //
+    // "isolated" when this key is present: the rig itself passed `--claude-config-dir`, which is
+    // observable with certainty (`derive_launch` in `record.rs` sets it). There is deliberately
+    // no "ambient" counterpart. `comet_harness::launch::LaunchDescriptor::spawn`
+    // (`crates/harness/src/launch.rs`) calls `.envs(&self.configured_env)` on a `Command` that is
+    // never `.env_clear()`-ed, so an unconfigured child still inherits the *recorder process's
+    // own* ambient `CLAUDE_CONFIG_DIR` if the operator happens to have one exported in their
+    // shell -- and `sanitize_dir` runs later, often in a different process, so it cannot see what
+    // that ambient value was even in principle. Stamping that case "ambient" would publish a claim
+    // the rig cannot back up: a capture that in fact inherited a real, non-empty
+    // `CLAUDE_CONFIG_DIR` from the capturer's shell would read as isolated-by-omission, which is
+    // the exact false reassurance D91 exists to stop the archive from making. "unknown" is the
+    // honest value for every case the rig cannot rule out, and it collapses with the plain-absent
+    // case on the 42 manifests promoted before this field existed -- both mean "nobody recorded
+    // this," which is the truth on both sides. See `.agents/rules/optional-wire-fields.md` on
+    // writing the absent case as "unknown," never as a specific answer the evidence doesn't
+    // support.
+    //
+    // Do not "simplify" this back to a two-value `isolated`/`ambient` enum: that is the exact
+    // regression this comment exists to block, and the rig's env-inheritance model (above) is why
+    // it would be wrong, not merely less informative.
+    //
+    // Non-Claude (Codex, ACP): the concept doesn't apply at all, so the field is omitted rather
+    // than given a third value that could be misread as either real answer.
+    if capture.provider == Provider::Claude {
+        let isolation = if capture
+            .command
+            .configured_env
+            .contains_key("CLAUDE_CONFIG_DIR")
+        {
+            "isolated"
+        } else {
+            "unknown"
+        };
+        manifest
+            .as_object_mut()
+            .expect("manifest is always built as a JSON object literal above")
+            .insert("claude_config_isolation".into(), json!(isolation));
+    }
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|source| SanitizationError::EncodeOutput { source })?;
     manifest_bytes.push(b'\n');
