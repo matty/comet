@@ -308,5 +308,5 @@ sheet title and finding them unrelated has found this, not a data-entry error.
   through at least two independent, non-overridable paths.
 - **D73** — the same "union across every tool's own parameter names" shape this row's `rawInput`
   finding is an instance of, for Claude.
-- **D77** (`README.md`) — a map nobody declares still publishes its keys; the reasoning
-  `rawInput`'s and `usage.modelUsage`'s `MAP_PATHS` declarations apply.
+- **D77** (`closed.md`) — suspected undeclared maps now hard-stop before promotion; the reasoning
+  behind `rawInput`'s and `usage.modelUsage`'s `MAP_PATHS` declarations still applies.

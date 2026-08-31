@@ -235,11 +235,15 @@ so an identifier sitting in an object *key* was invisible to it. A rogue key pla
 `.modelUsage` with no scalars beneath it fails the key property while the scalar property, the
 manifest-token property and the capability sheet's golden test all stay green.
 
-**When a report row names a key rather than a field, the object is a map and belongs in
-`surface::MAP_PATHS`.** That is the triage step for a novel map: the declaration is one edit, and
-it decides both questions at once — the capability sheet stops recording the key as a field name,
-and the sanitizer stops publishing it. Until it is declared, the keys ride through
-([D77](../debt/README.md)).
+**A suspected undeclared map stops sanitization before publishing a new staging artifact.** The
+diagnostic gives only its structurally-redacted path and key counts, never a key or value. Declare
+the path in `surface::MAP_PATHS`, then rerun the sanitizer; do not promote its prior output. An
+exact-path exemption needs a demonstrated false positive and a separate design, not an ad hoc
+override.
+
+**A confirmed map belongs in `surface::MAP_PATHS`.** That declaration decides both questions at
+once: the capability sheet stops recording its keys as field names, and the sanitizer stops
+publishing them.
 
 **A child of that map which production genuinely decodes goes in the declaration's own
 `named_children` list, not on the allowlist.** That keeps the key visible to the sheet — so a

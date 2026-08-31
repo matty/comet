@@ -4,6 +4,24 @@ Kept for the reasoning, not the status. Each of these merged;
 `README.md` carries the row and the PR. Delete an entry only if its
 explanation stops being useful to someone reading the code it touched.
 
+## D77 — undeclared map keys could be promoted
+
+**The gap.** An object at an undeclared path treated its keys as field names, so a provider could
+put account, machine, or MCP-server identifiers in those keys and commit them into the archive.
+The key property test only catches already-declared maps, while scalar, manifest, and capability
+sheet checks all miss a key-only object.
+
+**The earlier mitigation.** `surface::suspected_map` reported a strict-majority data-shaped key
+set during sanitization. Calibration over all 42 promoted files found zero false positives,
+including Grok's `x.ai/` namespace, and it fired on a unanimous single data-shaped key. It was
+advisory, so an operator could still publish the capture.
+
+**The close.** Sanitization now rejects the first suspected undeclared map before staging
+publication. Its typed error contains only a structurally-redacted path and counts, never a key or
+value; the nested regressions cover both identifier-shaped and declared-map ancestor keys. The
+existing zero-false-positive corpus calibration therefore backs a hard pre-publication gate. A
+real false positive may justify an exact-path exemption only through a separate design.
+
 ## D36 — provider default reasoning
 
 Codex's `model/list` reports `defaultReasoningEffort` per model. Comet now

@@ -6,16 +6,15 @@
 //! an error rather than an empty answer.
 //!
 //! The D77 tests below are a different layer of the same mechanism: not the
-//! corpus walker itself, but the review-time heuristic (`surface::suspected_map`,
-//! wired into `sanitize_dir`) that warns about an undeclared map *before* a
+//! corpus walker itself, but the pre-publication gate (`surface::suspected_map`,
+//! wired into `sanitize_dir`) that rejects an undeclared map *before* a
 //! corpus exists for the walker above to check at all.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use comet_capture::{
-    Direction, FieldObservation, corpus_root, observe_surface, render_suspected_maps_report,
-    sanitize_dir,
+    Direction, FieldObservation, SanitizationError, corpus_root, observe_surface, sanitize_dir,
 };
 use serde_json::{Value, json};
 
@@ -723,17 +722,14 @@ fn the_promoted_corpus_yields_the_control_protocol_subtypes() {
     );
 }
 
-/// D77's residual, closed as a heuristic warning rather than a hard gate:
-/// `surface::MAP_PATHS` still only rejects a declared map's own keys, so an
-/// object at an *undeclared* path (an MCP server name, an account, a
-/// machine) still publishes its keys verbatim -- this only makes sure a
-/// human reviewing the capture before promotion is told where to look.
+/// D77's residual: an object at an *undeclared* path (an MCP server name, an
+/// account, a machine) must block publication before it can publish its keys
+/// verbatim.
 ///
 /// Break caught: an undeclared object keyed by account ids, with no field
-/// name in sight, must produce a `SuspectedMap` naming the path -- and the
-/// rendered report must name the path without ever printing an actual key.
+/// name in sight, must reject staging without ever printing an actual key.
 #[test]
-fn sanitize_dir_warns_on_an_undeclared_object_keyed_by_account_ids() {
+fn sanitize_dir_rejects_an_undeclared_object_keyed_by_account_ids_without_printing_keys() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -745,33 +741,132 @@ fn sanitize_dir_warns_on_an_undeclared_object_keyed_by_account_ids() {
     );
     let output = staging_dir(temp.path(), "undeclared-account-map");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
-    let warning = report
-        .suspected_maps
-        .iter()
-        .find(|entry| entry.path == ".accounts")
-        .unwrap_or_else(|| {
-            panic!(
-                "no suspected-map warning for .accounts: {:?}",
-                report.suspected_maps
-            )
-        });
-    assert_eq!(warning.key_count, 2);
-    assert_eq!(warning.non_identifier_count, 2);
-
-    let rendered = render_suspected_maps_report(&report.suspected_maps);
-    assert!(rendered.contains(".accounts"), "{rendered}");
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
+    assert!(!rendered.contains("acct-7f2c9a1d"));
+    assert!(!rendered.contains("acct-04b6e2f9"));
     assert!(
-        !rendered.contains("acct-7f2c9a1d") && !rendered.contains("acct-04b6e2f9"),
-        "an account id must never be printed, even in a warning: {rendered}"
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
+/// An undeclared parent can be mixed, so its one data-shaped child may not
+/// trigger D77 until a nested object does. That ancestor key is still data and
+/// must not become part of the nested diagnostic path.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_a_mixed_parent_data_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-undeclared-account-map",
+        &[
+            r#"{"type":"system","subtype":"init","accounts":{"primary":{},"acct-private-42":{"model-7f2c":{},"model-04b6":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-undeclared-account-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".{}.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".{}.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
+    assert!(!rendered.contains("acct-private-42"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
+/// An identifier-shaped key under an undeclared object is not evidence that
+/// it is a field, so the nested diagnostic must fold it as structural data.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_an_identifier_shaped_account_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-identifier-account-map",
+        &[
+            r#"{"type":"system","subtype":"init","accounts":{"alice":{"model-a":{},"model-b":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-identifier-account-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".{}.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".{}.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("accounts"));
+    assert!(!rendered.contains("alice"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
+    );
+}
+
+/// Declared map keys are data even when their spelling looks like an ordinary
+/// identifier, so a nested suspected map must fold an unnamed parent key.
+#[test]
+fn sanitize_dir_rejects_a_nested_map_without_revealing_a_declared_map_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let raw = write_raw_capture(
+        temp.path(),
+        "nested-declared-model-map",
+        &[
+            r#"{"type":"system","subtype":"init","modelUsage":{"claude":{"model-7f2c":{},"model-04b6":{}}}}"#,
+            "stderr sentinel",
+        ],
+    );
+    let output = staging_dir(temp.path(), "nested-declared-model-map");
+
+    let error = sanitize_dir(&raw, &output).expect_err("D77 must block staging");
+    assert!(matches!(
+        error,
+        SanitizationError::SuspectedUndeclaredMap {
+            ref path,
+            key_count: 2,
+            non_identifier_count: 2,
+        } if path == ".modelUsage.{}"
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains(".modelUsage.{}") && rendered.contains("2 of 2"));
+    assert!(!rendered.contains("claude"));
+    assert!(
+        !output.exists(),
+        "a rejected capture must create no staging artifact"
     );
 }
 
 /// The false-negative-avoidance half: an object whose keys are ordinary
-/// field names must produce no warning at all.
+/// field names must still stage successfully.
 #[test]
-fn sanitize_dir_does_not_warn_on_an_object_with_ordinary_field_names() {
+fn sanitize_dir_accepts_an_object_with_ordinary_field_names() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -783,24 +878,21 @@ fn sanitize_dir_does_not_warn_on_an_object_with_ordinary_field_names() {
     );
     let output = staging_dir(temp.path(), "ordinary-fields");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
+    sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
     assert!(
-        report.suspected_maps.is_empty(),
-        "ordinary field names must not warn: {:?}",
-        report.suspected_maps
+        output.exists(),
+        "ordinary field objects must remain promotable"
     );
 }
 
 /// The false-positive guard, exercised end to end rather than as a pure-function
 /// unit test: a single vendor-namespaced key sitting beside four ordinary
 /// siblings -- `_meta`'s own real shape, already reviewed field-by-field on
-/// `allowlist/acp.txt` -- must not read as a suspected map. A heuristic that
-/// fired here would repeat on every single ACP sanitize run against an
-/// already-settled decision, which is the "fires on everything" failure this
-/// row explicitly warns against.
+/// `allowlist/acp.txt` -- must still stage successfully. A heuristic that
+/// rejects here would block every ACP sanitize run against an already-settled
+/// decision, which is the "fires on everything" failure this row guards.
 #[test]
-fn sanitize_dir_does_not_warn_when_one_vendor_key_sits_among_ordinary_siblings() {
+fn sanitize_dir_accepts_one_vendor_key_among_ordinary_siblings() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
@@ -812,14 +904,9 @@ fn sanitize_dir_does_not_warn_when_one_vendor_key_sits_among_ordinary_siblings()
     );
     let output = staging_dir(temp.path(), "meta-vendor-namespace");
 
-    let report = sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
-
+    sanitize_dir(&raw, &output).expect("an ordinary capture sanitizes cleanly");
     assert!(
-        !report
-            .suspected_maps
-            .iter()
-            .any(|entry| entry.path == ".result._meta"),
-        "one namespaced field among four plain ones must not warn: {:?}",
-        report.suspected_maps
+        output.exists(),
+        "one vendor key among ordinary siblings must remain promotable"
     );
 }

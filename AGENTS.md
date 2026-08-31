@@ -137,8 +137,9 @@ repository, and `docs/testing/provider-captures.md` is the review procedure for 
 sanitizing — each promoted version's capability sheet (below) is a snapshot of exactly those
 names. A key that *is* data, under a path declared in `surface::MAP_PATHS`, redacts by default
 like a value. Declaring a new map is one edit serving both: the sheet stops recording the key as
-a field, and the sanitizer stops publishing it. A map nobody declared still publishes its keys
-(D77).
+a field, and the sanitizer stops publishing it. A suspected undeclared map now stops sanitization
+before staging; its diagnostic names only a structurally redacted path and counts (D77,
+[`closed.md`](docs/debt/closed.md)).
 
 **A declared map can name individual children that are field names after all.** A `MapPath`'s
 `named_children` list exempts those keys from the fold, so the sheet records them under their own
