@@ -497,6 +497,7 @@ impl Harness for HermesHarness {
             crate::all_known_dirs(hermes_install_dirs()),
         )
         .await
+        .0
     }
 
     /// The curated catalog unioned with whatever the handshake reported.

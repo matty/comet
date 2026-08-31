@@ -307,7 +307,7 @@ impl Harness for ClaudeHarness {
     }
 
     async fn probe(&self) -> HarnessProbe {
-        let mut probe = crate::probe_installed_cli(
+        let (mut probe, _) = crate::probe_installed_cli(
             self.resolve_executable(),
             "claude",
             "CLAUDE_CODE_EXECUTABLE",

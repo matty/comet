@@ -698,6 +698,7 @@ impl Harness for GrokHarness {
             crate::all_known_dirs(grok_install_dirs()),
         )
         .await
+        .0
     }
 
     /// The curated catalog unioned with whatever the handshake reported.

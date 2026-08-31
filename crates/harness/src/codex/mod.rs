@@ -52,8 +52,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessAvailability, HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog,
-    RunRequest, RuntimeMode, SteeringMode,
+    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, RunRequest,
+    RuntimeMode, SteeringMode,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -447,7 +447,7 @@ impl Harness for CodexHarness {
     }
 
     async fn probe(&self) -> HarnessProbe {
-        let mut probe = crate::probe_installed_cli(
+        let (mut probe, installed) = crate::probe_installed_cli(
             self.resolve_executable(),
             "codex",
             "CODEX_EXECUTABLE",
@@ -459,14 +459,10 @@ impl Harness for CodexHarness {
         // A blocking read is deliberate: it is ~100 bytes of local file, and
         // `probe` already runs in the engine's background boot task behind a
         // subprocess spawn that costs orders of magnitude more.
-        let installed = match &probe.availability {
-            HarnessAvailability::Available { version } => version.as_deref(),
-            _ => None,
-        };
         probe.update = update::read_resolved_update(
             probe.install.as_ref(),
             self.codex_home().as_deref(),
-            installed,
+            installed.as_deref(),
         );
         probe
     }
