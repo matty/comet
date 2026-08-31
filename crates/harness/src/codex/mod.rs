@@ -915,6 +915,10 @@ async fn run_session(session: Session) {
                     "turn/started" => router.note_started(turn_id(&params)),
 
                     "item/agentMessage/delta" => {
+                        // Unowned provider content must not attach to a future transcript entry.
+                        if router.active.is_none() && queued_steers.is_empty() {
+                            continue;
+                        }
                         streamed_text.insert(item_id(&params));
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::TextDelta { text }).await
@@ -924,6 +928,9 @@ async fn run_session(session: Session) {
                     }
 
                     "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                        if router.active.is_none() && queued_steers.is_empty() {
+                            continue;
+                        }
                         if let Some(text) = delta_text(&params)
                             && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
                         {
@@ -935,6 +942,9 @@ async fn run_session(session: Session) {
                     // snapshot per change rather than a delta, which is why
                     // this is a replacement and needs no accumulator.
                     "turn/plan/updated" => {
+                        if router.active.is_none() && queued_steers.is_empty() {
+                            continue;
+                        }
                         if let Some(event) = plan_update_event(&params)
                             && !send(&event_tx, event).await
                         {
@@ -943,6 +953,9 @@ async fn run_session(session: Session) {
                     }
 
                     "item/started" | "item/completed" => {
+                        if router.active.is_none() && queued_steers.is_empty() {
+                            continue;
+                        }
                         let phase = if method == "item/started" {
                             Phase::Started
                         } else {
@@ -986,6 +999,9 @@ async fn run_session(session: Session) {
                     }
 
                     "thread/tokenUsage/updated" => {
+                        if router.active.is_none() && queued_steers.is_empty() {
+                            continue;
+                        }
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);
                         }
