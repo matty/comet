@@ -130,7 +130,7 @@ fn stage_marker_matches(directory: &Path, expected: &str) -> bool {
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
 /// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
-pub fn platform_key() -> (&'static str, &'static str) {
+fn platform_key() -> (&'static str, &'static str) {
     let os = if cfg!(target_os = "macos") {
         "macos"
     } else {

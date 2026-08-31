@@ -69,7 +69,7 @@ pub fn pending_approval(transcript: &[SessionMessageEntry]) -> Option<(String, A
 
 /// The decision recorded for `request_id` anywhere in the transcript — what
 /// releases the decision row, and what the card renders as its terminal state.
-pub fn approval_decision(
+fn approval_decision(
     transcript: &[SessionMessageEntry],
     request_id: &str,
 ) -> Option<ApprovalDecision> {

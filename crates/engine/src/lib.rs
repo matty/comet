@@ -12,8 +12,6 @@ use std::sync::Arc;
 pub use comet_identity::DeviceIdentity;
 pub use comet_proto::HarnessId;
 
-use comet_sync::DocsStore;
-
 mod approvals;
 mod unattended;
 
@@ -22,7 +20,6 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod lan_server;
-pub mod local_store;
 pub mod registry;
 pub mod remote_config;
 pub mod remote_rpc;
@@ -31,6 +28,7 @@ pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
 pub mod spaces;
+pub mod store;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
@@ -44,7 +42,6 @@ pub use diff_sync::{
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig};
 pub use instance_lock::InstanceLock;
 pub use lan_server::{LanServer, LanServerHandle, LanServerStatus};
-pub use local_store::initialize_local_store;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use remote_config::RemoteConfigStore;
 pub use remote_rpc::{RemoteRpcService, remote_method_allowed};
@@ -53,6 +50,7 @@ pub use rpc::{EngineRpc, LocalRpcService};
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
+pub use store::{DocsStore, PutToolDiffOutcome, StoreError, ToolDiffLimit};
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use unattended::{
@@ -63,6 +61,10 @@ pub use unattended::{
 pub use uploads::{AttachmentChunk, Uploads};
 pub use workspace_host::{WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig};
 
+/// The one authoritative store directory for this Comet installation, under
+/// the engine's data dir.
+const LOCAL_STORE_DIR: &str = "local-store";
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("identity: {0}")]
@@ -72,7 +74,7 @@ pub enum EngineError {
     #[error("journal: {0}")]
     Journal(#[from] run_journal::JournalError),
     #[error("store: {0}")]
-    Store(#[from] comet_sync::StoreError),
+    Store(#[from] crate::StoreError),
     #[error("harness: {0}")]
     Harness(#[from] comet_harness::HarnessError),
     #[error("io: {0}")]
@@ -189,7 +191,9 @@ impl EngineCore {
             }
         }
         let lan_server = LanServerHandle::new(remote_config.clone(), device_identity.clone());
-        let local_root = initialize_local_store(data_dir)?;
+        // `DocsStore::open` creates the whole path, so the store root is the
+        // only thing this needs to name.
+        let local_root = data_dir.join(LOCAL_STORE_DIR);
         let store = Arc::new(DocsStore::open(&local_root)?);
         let journal = Arc::new(RunJournal::open(local_root.join("journals"))?);
         let detected_device_name = local_device_name();

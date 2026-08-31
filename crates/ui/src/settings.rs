@@ -359,7 +359,7 @@ pub fn conflicted_shortcuts(keymap: &KeymapConfig) -> Vec<ShortcutId> {
 
 /// The modifiers a stored combo carries, as `(mod, alt, shift)`. Everything
 /// before the final segment is a modifier; the final segment is the key.
-pub fn combo_modifiers(combo: &str) -> (bool, bool, bool) {
+fn combo_modifiers(combo: &str) -> (bool, bool, bool) {
     let mut parts: Vec<&str> = combo.split('-').collect();
     parts.pop();
     (
@@ -450,7 +450,7 @@ pub fn badge_combo(combo: &str) -> String {
 }
 
 /// [`badge_combo`] for an explicit platform.
-pub fn badge_combo_on(mac: bool, combo: &str) -> String {
+fn badge_combo_on(mac: bool, combo: &str) -> String {
     if !mac {
         return display_combo_on(false, combo);
     }

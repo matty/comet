@@ -55,24 +55,24 @@ pub type VeilSpan = (Range<usize>, f32);
 
 /// Text alpha for a fade progress `p` (0..1): the veil dissolves as
 /// `(1 − p)^1.6`, so the text shows through at `1 − veil`. Pure.
-pub fn veil_opacity(p: f32) -> f32 {
+fn veil_opacity(p: f32) -> f32 {
     1.0 - (1.0 - p.clamp(0.0, 1.0)).powf(VEIL_CURVE_POW)
 }
 
 /// Chunk fade duration for the current inter-append EMA (mugen:
 /// `min(MAX, max(MIN, ema * 3))`).
-pub fn veil_duration_ms(ema_ms: f32) -> f32 {
+fn veil_duration_ms(ema_ms: f32) -> f32 {
     (ema_ms * 3.0).clamp(VEIL_MIN_FADE_MS, VEIL_MAX_FADE_MS)
 }
 
 /// Fast-stream boost: 3+ chunks fading concurrently speed up by 30% each
 /// (mugen: `1 + 0.3 * max(0, veils.length - 2)`).
-pub fn veil_boost(active_chunks: usize) -> f32 {
+fn veil_boost(active_chunks: usize) -> f32 {
     1.0 + 0.3 * active_chunks.saturating_sub(2) as f32
 }
 
 /// EMA update on a new append gap (mugen: `ema*0.7 + min(gap,1000)*0.3`).
-pub fn veil_ema_next(ema_ms: f32, gap_ms: f32) -> f32 {
+fn veil_ema_next(ema_ms: f32, gap_ms: f32) -> f32 {
     ema_ms * 0.7 + gap_ms.min(VEIL_GAP_CLAMP_MS) * 0.3
 }
 

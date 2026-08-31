@@ -22,13 +22,13 @@ use futures::stream::BoxStream;
 use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
 };
+use comet_engine::DocsStore;
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessCapabilities, HarnessId, ModelCatalog, ReasoningLevel,
     RunRequest, RuntimeMode, SandboxLevel, SteeringMode,
 };
-use comet_sync::DocsStore;
 
 const CHAT: &str = "chat-restart";
 

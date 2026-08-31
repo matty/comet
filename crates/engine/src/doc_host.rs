@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::watch;
 
+use crate::{DocsStore, PutToolDiffOutcome};
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
@@ -28,7 +29,6 @@ use comet_doc::{
     join_continuation_entries,
 };
 use comet_proto::{ApprovalDecision, HarnessId, ToolDiff, UserInputAnswer, UserInputQuestion};
-use comet_sync::{DocsStore, PutToolDiffOutcome};
 
 use crate::sessions::{SessionCleanupError, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
@@ -394,7 +394,7 @@ impl DocHost {
         chat_id: &str,
         part_id: &str,
         diff: &ToolDiff,
-    ) -> Result<PutToolDiffOutcome, comet_sync::StoreError> {
+    ) -> Result<PutToolDiffOutcome, crate::StoreError> {
         let gate = lock(&self.inner.purge_gate);
         if matches!(
             gate.chats.get(chat_id),
@@ -404,7 +404,7 @@ impl DocHost {
                     | ChatLifecycle::Purged { .. }
             )
         ) {
-            return Err(comet_sync::StoreError::ToolDiffPurged);
+            return Err(crate::StoreError::ToolDiffPurged);
         }
         // Keep the lifecycle gate held through the write. A concurrent
         // begin-purge waits for this write and then deletes it, while a later
@@ -601,7 +601,7 @@ impl DocHost {
         chat_id: &str,
         part_id: &str,
         diff_ref: &str,
-    ) -> Result<Option<ToolDiff>, comet_sync::StoreError> {
+    ) -> Result<Option<ToolDiff>, crate::StoreError> {
         self.inner.store.read_tool_diff(chat_id, part_id, diff_ref)
     }
 
@@ -846,8 +846,8 @@ impl DocHost {
         delete_tool_diffs: DeleteToolDiffs,
     ) -> Option<PurgeCleanupOutcome>
     where
-        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
-        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteSnapshot: FnOnce(&str) -> Result<(), crate::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), crate::StoreError>,
     {
         let gate = lock(&self.inner.purge_gate);
         self.cleanup_purging_chat_locked_with(
@@ -868,8 +868,8 @@ impl DocHost {
         delete_tool_diffs: DeleteToolDiffs,
     ) -> Option<PurgeCleanupOutcome>
     where
-        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
-        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteSnapshot: FnOnce(&str) -> Result<(), crate::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), crate::StoreError>,
     {
         if !matches!(
             gate.chats.get(chat_id),
@@ -900,8 +900,8 @@ impl DocHost {
         retire_session: RetireSession,
     ) -> PurgeCleanupOutcome
     where
-        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
-        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteSnapshot: FnOnce(&str) -> Result<(), crate::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), crate::StoreError>,
         RetireSession: FnOnce(&str) -> Result<(), SessionCleanupError>,
     {
         // The caller holds the purge gate. Retire the session first so the
@@ -939,8 +939,8 @@ impl DocHost {
         delete_tool_diffs: DeleteToolDiffs,
     ) -> PurgeCleanupOutcome
     where
-        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
-        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteSnapshot: FnOnce(&str) -> Result<(), crate::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), crate::StoreError>,
     {
         let mut retry_needed = false;
         if let Err(err) = delete_snapshot(chat_id) {
@@ -981,8 +981,8 @@ impl DocHost {
         retire_session: RetireSession,
     ) -> PurgeFinishOutcome
     where
-        DeleteSnapshot: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
-        DeleteToolDiffs: FnOnce(&str) -> Result<(), comet_sync::StoreError>,
+        DeleteSnapshot: FnOnce(&str) -> Result<(), crate::StoreError>,
+        DeleteToolDiffs: FnOnce(&str) -> Result<(), crate::StoreError>,
         RetireSession: FnOnce(&str) -> Result<(), SessionCleanupError>,
     {
         let mut gate = lock(&self.inner.purge_gate);
@@ -1949,9 +1949,7 @@ mod tests {
                 |chat_id| {
                     snapshot_attempts.set(snapshot_attempts.get() + 1);
                     if failing_leg == "snapshot" {
-                        Err(comet_sync::StoreError::Sqlite(
-                            rusqlite::Error::InvalidQuery,
-                        ))
+                        Err(crate::StoreError::Sqlite(rusqlite::Error::InvalidQuery))
                     } else {
                         store.delete_snapshot(chat_id)
                     }
@@ -1959,9 +1957,7 @@ mod tests {
                 |chat_id| {
                     sidecar_attempts.set(sidecar_attempts.get() + 1);
                     if failing_leg == "sidecar" {
-                        Err(comet_sync::StoreError::Sqlite(
-                            rusqlite::Error::InvalidQuery,
-                        ))
+                        Err(crate::StoreError::Sqlite(rusqlite::Error::InvalidQuery))
                     } else {
                         store.delete_tool_diffs(chat_id)
                     }
@@ -1987,9 +1983,7 @@ mod tests {
                 |chat_id| {
                     snapshot_attempts.set(snapshot_attempts.get() + 1);
                     if failing_leg == "snapshot" {
-                        Err(comet_sync::StoreError::Sqlite(
-                            rusqlite::Error::InvalidQuery,
-                        ))
+                        Err(crate::StoreError::Sqlite(rusqlite::Error::InvalidQuery))
                     } else {
                         store.delete_snapshot(chat_id)
                     }
@@ -1997,9 +1991,7 @@ mod tests {
                 |chat_id| {
                     sidecar_attempts.set(sidecar_attempts.get() + 1);
                     if failing_leg == "sidecar" {
-                        Err(comet_sync::StoreError::Sqlite(
-                            rusqlite::Error::InvalidQuery,
-                        ))
+                        Err(crate::StoreError::Sqlite(rusqlite::Error::InvalidQuery))
                     } else {
                         store.delete_tool_diffs(chat_id)
                     }
@@ -2181,7 +2173,7 @@ mod tests {
         );
         assert!(matches!(
             host.put_tool_diff("chat-1", "new-generation-tool", &diff),
-            Err(comet_sync::StoreError::ToolDiffPurged)
+            Err(crate::StoreError::ToolDiffPurged)
         ));
 
         assert_eq!(

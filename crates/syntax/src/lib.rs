@@ -700,7 +700,7 @@ const CAPTURE_KINDS: &[HighlightKind] = &[
     HighlightKind::Invalid,
 ];
 
-pub fn detect_language(
+fn detect_language(
     path: Option<&str>,
     fence_tag: Option<&str>,
     first_line: Option<&str>,

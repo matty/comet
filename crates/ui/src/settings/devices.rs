@@ -27,7 +27,7 @@ pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bo
 }
 
 /// Compact last-seen line. Pure.
-pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(at) = last_seen else {
         return "never seen".to_string();
     };
@@ -181,7 +181,7 @@ impl DevicesPage {
 }
 
 /// Human platform label (comet settings.devices.tsx `platformLabel`).
-pub fn platform_label(platform: &str) -> &str {
+fn platform_label(platform: &str) -> &str {
     match platform {
         "macos" | "darwin" => "macOS",
         "linux" => "Linux",
@@ -194,7 +194,7 @@ pub fn platform_label(platform: &str) -> &str {
 }
 
 /// Short device id for the click-to-copy chip (`abcd1234…wxyz`).
-pub fn short_id(id: &str) -> String {
+fn short_id(id: &str) -> String {
     if id.len() > 12 {
         format!("{}…{}", &id[..8], &id[id.len() - 4..])
     } else {

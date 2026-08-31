@@ -281,7 +281,7 @@ impl FileDiff {
 /// left gap so the number never abuts the accent bar (at 4 digits the old
 /// formula left 1.6px — visually touching; user report). Never narrower
 /// than the classic 36px column.
-pub fn gutter_width(file: &FileDiff) -> f32 {
+fn gutter_width(file: &FileDiff) -> f32 {
     let digits = file.max_line.max(1).ilog10() + 1;
     (digits as f32 * 6.6 + 8.0 + 6.0).max(GUTTER_WIDTH)
 }
@@ -341,7 +341,7 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
 
 /// Parse a unified git patch into file sections. Tolerant: unknown header
 /// lines are skipped, truncated hunks keep what parsed so far.
-pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
+fn parse_patch(patch: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut in_hunk = false;
     let mut old_no: u32 = 0;
@@ -471,7 +471,7 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
 }
 
 /// Derived per-file notice rows (new/deleted/renamed/binary + parser notices).
-pub fn file_notices(file: &FileDiff) -> Vec<String> {
+fn file_notices(file: &FileDiff) -> Vec<String> {
     let mut notices = Vec::new();
     match file.status {
         FileStatus::Added => notices.push("New file".to_string()),
@@ -529,7 +529,7 @@ pub fn body_height(file: &FileDiff) -> f32 {
     body_height_with(file, &[], None)
 }
 
-pub fn body_height_with(
+fn body_height_with(
     file: &FileDiff,
     comments: &[DiffComment],
     draft: Option<(CommentSide, u32)>,
@@ -542,7 +542,7 @@ pub fn body_height_with(
 
 /// A deletion only exists in the pre-change file; everything else is cited
 /// against the post-change file, which is what the agent edits.
-pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
+fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
     match line.kind {
         LineKind::Meta => None,
         LineKind::Del => line.old_no.map(|no| (CommentSide::Old, no)),
@@ -550,7 +550,7 @@ pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
     }
 }
 
-pub fn draft_belongs_to(
+fn draft_belongs_to(
     owner: &comet_proto::ServerRef,
     selected: Option<&comet_proto::ServerRef>,
 ) -> bool {
@@ -576,7 +576,7 @@ fn discard_stale_draft<T>(
 
 /// The diff shown for a chat: `checkout_id` match first, then device+cwd,
 /// then cwd alone (§1.11).
-pub fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a CheckoutDiff> {
+fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a CheckoutDiff> {
     if let Some(checkout_id) = chat.checkout_id.as_deref()
         && let Some(diff) = diffs.iter().find(|d| d.checkout_id == checkout_id)
     {
@@ -598,7 +598,7 @@ pub enum DiffPhase {
     List,
 }
 
-pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
+fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
     match resolved {
         None => DiffPhase::Preparing,
         Some(diff) if diff.patch.trim().is_empty() && diff.files.is_empty() => DiffPhase::Clean,
@@ -607,7 +607,7 @@ pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
 }
 
 /// Header label: "N Uncommitted change(s)".
-pub fn uncommitted_label(count: usize) -> String {
+fn uncommitted_label(count: usize) -> String {
     if count == 1 {
         "1 Uncommitted change".to_string()
     } else {
@@ -619,7 +619,7 @@ pub fn uncommitted_label(count: usize) -> String {
 /// list (replace) or a single `CheckoutDiff` (upsert by checkout id) — the
 /// contract streams `CheckoutDiff` items, but list frames cost nothing to
 /// support. Returns whether anything changed.
-pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
+fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
     if let Ok(all) = serde_json::from_value::<Vec<CheckoutDiff>>(value.clone()) {
         if *diffs != all {
             *diffs = all;
@@ -891,12 +891,12 @@ impl DiffRow {
 }
 
 /// Capacity hint only — comment cards are not counted.
-pub fn body_row_count(file: &FileDiff) -> usize {
+fn body_row_count(file: &FileDiff) -> usize {
     let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
     file_notices(file).len() + file.hunks.len() + lines + 1
 }
 
-pub fn body_rows(
+fn body_rows(
     file_ix: u32,
     file: &FileDiff,
     comments: &[DiffComment],
@@ -979,7 +979,7 @@ pub fn body_rows(
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
 /// its header. `comments` is the whole staged set; each file takes its own
 /// path's slice.
-pub fn flatten_rows(
+fn flatten_rows(
     files: &[FileDiff],
     comments: &[DiffComment],
     draft: Option<(&str, CommentSide, u32)>,
@@ -2487,7 +2487,7 @@ pub const COMMENT_ADDER_SIZE: f32 = 16.0;
 
 /// A row carries both gutters side by side, and a deletion numbers in the
 /// first.
-pub fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
+fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
     let column = match side {
         CommentSide::Old => 0.0,
         CommentSide::New => gutter_px,

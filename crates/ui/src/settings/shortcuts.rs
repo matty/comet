@@ -23,7 +23,7 @@ pub enum RecordOutcome {
     Set(String),
 }
 
-pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> RecordOutcome {
+fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> RecordOutcome {
     if key.eq_ignore_ascii_case("escape") {
         return RecordOutcome::Cancelled;
     }
@@ -114,7 +114,7 @@ impl ShortcutsPage {
 }
 
 /// The shortcut (other than `id`) already bound to `combo`, if any. Pure.
-pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Option<ShortcutId> {
+fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Option<ShortcutId> {
     ShortcutId::ALL
         .into_iter()
         .find(|&other| other != id && keymap.get(other) == combo)

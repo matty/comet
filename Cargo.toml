@@ -6,7 +6,6 @@ members = [
     "crates/syntax",
     "crates/proto",
     "crates/doc",
-    "crates/sync",
     "crates/harness",
     "crates/capture",
     "crates/engine",
@@ -27,7 +26,6 @@ comet-client = { path = "crates/client" }
 comet-identity = { path = "crates/identity" }
 comet-proto = { path = "crates/proto" }
 comet-doc = { path = "crates/doc" }
-comet-sync = { path = "crates/sync" }
 comet-harness = { path = "crates/harness" }
 comet-capture = { path = "crates/capture" }
 comet-engine = { path = "crates/engine" }

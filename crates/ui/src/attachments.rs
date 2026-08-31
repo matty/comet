@@ -208,7 +208,7 @@ pub fn format_by_extension(path: &Path) -> Option<ImageFormat> {
 
 /// use-attachments.ts `ensureExtension`: pasted screenshots often arrive as a
 /// bare "image" — make sure the staged name carries a type-matching extension.
-pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
+fn ensure_extension(name: &str, format: ImageFormat) -> String {
     let has_ext = name
         .rsplit_once('.')
         .map(|(stem, ext)| {

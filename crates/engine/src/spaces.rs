@@ -350,8 +350,8 @@ async fn spaces_task(inner: Weak<SpacesSyncInner>, mut spaces_rx: watch::Receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DocsStore;
     use crate::workspace_host::WorkspaceHostConfig;
-    use comet_sync::DocsStore;
 
     fn workspace_host(dir: &Path) -> WorkspaceHost {
         let store = Arc::new(DocsStore::open(dir.join("local-store")).unwrap());

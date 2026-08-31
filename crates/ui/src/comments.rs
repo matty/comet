@@ -177,7 +177,7 @@ const CARD_MAX_LINES: usize = 8;
 
 /// Wraps are guessed, not measured: the changes pane sizes bodies by arithmetic
 /// to drive the fold tween, and a measured card would desync it.
-pub fn card_body_lines(body: &str) -> usize {
+fn card_body_lines(body: &str) -> usize {
     body.lines()
         .map(|line| line.chars().count().div_ceil(CARD_WRAP_COLUMNS).max(1))
         .sum::<usize>()

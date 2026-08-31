@@ -190,10 +190,7 @@ fn update_line(update: Option<&HarnessUpdate>, now: DateTime<Utc>) -> Option<Upd
 /// CLI with no readable version still earns a line, because **the method and
 /// path are the diagnostic half**. A broken install is exactly when knowing
 /// which binary was asked matters most.
-pub fn install_line(
-    descriptor: Option<&HarnessDescriptor>,
-    now: DateTime<Utc>,
-) -> Option<InstallLine> {
+fn install_line(descriptor: Option<&HarnessDescriptor>, now: DateTime<Utc>) -> Option<InstallLine> {
     let descriptor = descriptor?;
     let install = descriptor.install.as_ref()?;
     let version = match &descriptor.availability {
@@ -214,7 +211,7 @@ pub fn install_line(
 }
 
 /// Threshold classification of a usage fraction. Pure.
-pub fn usage_level(fraction: f32) -> UsageLevel {
+fn usage_level(fraction: f32) -> UsageLevel {
     if fraction >= USAGE_CRITICAL_FRACTION {
         UsageLevel::Critical
     } else if fraction >= USAGE_WARN_FRACTION {
@@ -224,7 +221,7 @@ pub fn usage_level(fraction: f32) -> UsageLevel {
     }
 }
 
-pub fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
+fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
     match level {
         UsageLevel::Normal => theme.accent,
         UsageLevel::Warn => theme.warning,
@@ -256,7 +253,7 @@ pub enum LoadTrigger {
 /// list (mount, or retry after a failure) must force, or every first open
 /// renders "Usage unavailable" until a manual Refresh — the old app fetched
 /// usage on every list. Post-Switch/Forget lists ride the still-warm cache.
-pub fn force_usage_for(trigger: LoadTrigger) -> bool {
+fn force_usage_for(trigger: LoadTrigger) -> bool {
     match trigger {
         LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::Refresh | LoadTrigger::PostLogin => {
             true
@@ -270,7 +267,7 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
 /// ("Mon") within a week, else month + day ("Sep 14") — a weekday is noise
 /// when the window is a Codex free-tier MONTHLY reset weeks out. The caller
 /// prefixes "resets ". Pure given `now`.
-pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
+fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
     let at = resets_at?;
     let local = at.with_timezone(&Local);
@@ -294,10 +291,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
 /// active-first re-sort: switching accounts must not move the switched-to
 /// card — the Active badge already says which one is live, and a list that
 /// reshuffles under the click reads as broken. Pure.
-pub fn provider_accounts(
-    snapshot: &AgentAccountsSnapshot,
-    harness: HarnessId,
-) -> Vec<&AgentAccount> {
+fn provider_accounts(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Vec<&AgentAccount> {
     snapshot
         .accounts
         .iter()
@@ -317,7 +311,7 @@ fn message_noun(n: u64) -> &'static str {
 /// `None` when the provider has nothing recorded — the block is HIDDEN at
 /// zero, which the harness-side Ignored tier keeps as the normal state.
 /// `name` is the Agent's display name (never a harness id).
-pub fn diagnostics_rollup(
+fn diagnostics_rollup(
     list: &[HarnessDiagnostics],
     harness: HarnessId,
     name: &str,
@@ -343,7 +337,7 @@ pub fn diagnostics_rollup(
 /// Ages a per-boot diagnostic count. Has no day bucket on purpose — see the
 /// bucket-edge test. [`relative_age`] is the one for provider timestamps that
 /// can be months old; the two are not a duplication to collapse.
-pub fn format_ago(last_seen_ms: i64, now_ms: i64) -> String {
+fn format_ago(last_seen_ms: i64, now_ms: i64) -> String {
     let secs = (now_ms - last_seen_ms).max(0) / 1000;
     if secs < 10 {
         "just now".into()

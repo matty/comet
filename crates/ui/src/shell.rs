@@ -86,7 +86,7 @@ pub struct JumpSession(pub usize);
 /// left edge (comet window-controls.tsx: `left: fullscreen ? 12 : 88`). The
 /// frameless hiddenInset chrome puts the macOS traffic lights at {14,15};
 /// fullscreen hides them and the cluster reclaims the inset.
-pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
+fn titlebar_cluster_start(fullscreen: bool) -> f32 {
     if fullscreen { 12.0 } else { 88.0 }
 }
 
@@ -105,7 +105,7 @@ pub fn titlebar_spacer_width(is_macos: bool, fullscreen: bool, container_pad: f3
 pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
 
 /// Where the cluster's first button starts, from the window's left edge.
-pub fn cluster_buttons_start(is_macos: bool, fullscreen: bool) -> f32 {
+fn cluster_buttons_start(is_macos: bool, fullscreen: bool) -> f32 {
     if is_macos {
         titlebar_cluster_start(fullscreen)
     } else {
@@ -528,7 +528,7 @@ pub const RESORT: MotionSpec = MotionSpec::new(260, motion::EASE_RESORT);
 /// order (key + row height), return each surviving key's paint-only start
 /// offset `old_y - new_y` (only keys whose position actually moved). `gap` is
 /// the flex gap between rows. Pure — drives the sidebar resort glide.
-pub fn resort_offsets(
+fn resort_offsets(
     old: &[(String, f32)],
     new: &[(String, f32)],
     gap: f32,

@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use crate::{PutToolDiffOutcome, ToolDiffLimit};
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
@@ -33,7 +34,6 @@ use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DoneStatus, HarnessId, RunRequest, RuntimeMode,
     Session, SessionStatus, SubagentStatus, ToolDiff, UserInputAnswer, UserInputQuestion,
 };
-use comet_sync::{PutToolDiffOutcome, ToolDiffLimit};
 
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::HarnessRegistry;
@@ -1867,14 +1867,14 @@ impl Inner {
 /// have already been removed from the event in every variant.
 enum PrepareToolDiffFailure {
     Rejected(ToolDiffLimit),
-    Store(comet_sync::StoreError),
+    Store(crate::StoreError),
 }
 
 /// Strip exact Write/Edit call inputs and move exact tool-result sources into
 /// the sidecar before an event can reach a journal, subscriber, or document.
 fn prepare_event_with<F>(event: &mut AgentEvent, persist: F) -> Option<PrepareToolDiffFailure>
 where
-    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, comet_sync::StoreError>,
+    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, crate::StoreError>,
 {
     if let AgentEvent::ToolCall { call, .. } = event {
         match call {
@@ -1898,7 +1898,7 @@ where
 /// ToolCall has already been stripped at the authoritative event boundary.
 fn prepare_tool_result_with<F>(event: &mut AgentEvent, persist: F) -> Option<PrepareToolDiffFailure>
 where
-    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, comet_sync::StoreError>,
+    F: FnOnce(&str, &ToolDiff) -> Result<PutToolDiffOutcome, crate::StoreError>,
 {
     let AgentEvent::ToolResult {
         id,
@@ -2899,7 +2899,7 @@ async fn drive_run(
 mod tests {
     use super::*;
     use crate::DocHostConfig;
-    use comet_sync::DocsStore;
+    use crate::DocsStore;
 
     fn engine(dir: &std::path::Path) -> SessionsEngine {
         let journal = Arc::new(RunJournal::open(dir).expect("journal opens"));
@@ -3371,41 +3371,35 @@ mod tests {
 
         let mut store_failure = event_with_source();
         let failure = prepare_tool_result_with(&mut store_failure, |_part_id, _diff| {
-            Err(comet_sync::StoreError::Sqlite(
-                rusqlite::Error::InvalidQuery,
-            ))
+            Err(crate::StoreError::Sqlite(rusqlite::Error::InvalidQuery))
         });
         assert!(matches!(
             failure,
-            Some(PrepareToolDiffFailure::Store(
-                comet_sync::StoreError::Sqlite(_)
-            ))
+            Some(PrepareToolDiffFailure::Store(crate::StoreError::Sqlite(_)))
         ));
         assert_stripped(&store_failure);
 
         let mut quota_failure = event_with_source();
         let failure = prepare_tool_result_with(&mut quota_failure, |_part_id, _diff| {
-            Err(comet_sync::StoreError::ToolDiffQuota)
+            Err(crate::StoreError::ToolDiffQuota)
         });
         assert!(matches!(
             failure,
             Some(PrepareToolDiffFailure::Store(
-                comet_sync::StoreError::ToolDiffQuota
+                crate::StoreError::ToolDiffQuota
             ))
         ));
         assert_stripped(&quota_failure);
 
         let mut rejected = event_with_source();
         let failure = prepare_tool_result_with(&mut rejected, |_part_id, _diff| {
-            Ok(comet_sync::PutToolDiffOutcome::Rejected(
-                comet_sync::ToolDiffLimit::Path,
+            Ok(crate::PutToolDiffOutcome::Rejected(
+                crate::ToolDiffLimit::Path,
             ))
         });
         assert!(matches!(
             failure,
-            Some(PrepareToolDiffFailure::Rejected(
-                comet_sync::ToolDiffLimit::Path
-            ))
+            Some(PrepareToolDiffFailure::Rejected(crate::ToolDiffLimit::Path))
         ));
         assert_stripped(&rejected);
 

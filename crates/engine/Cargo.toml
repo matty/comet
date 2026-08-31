@@ -9,7 +9,6 @@ publish.workspace = true
 comet-identity.workspace = true
 comet-proto.workspace = true
 comet-doc.workspace = true
-comet-sync.workspace = true
 comet-harness.workspace = true
 comet-rpc.workspace = true
 comet-update.workspace = true

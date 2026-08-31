@@ -71,10 +71,7 @@ fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
-pub fn rail_ticks(
-    entries: &[SessionMessageEntry],
-    echoes: &[SessionMessageEntry],
-) -> Vec<RailTick> {
+fn rail_ticks(entries: &[SessionMessageEntry], echoes: &[SessionMessageEntry]) -> Vec<RailTick> {
     let mut ticks: Vec<RailTick> = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
         if entry.role != MessageRole::User {
@@ -101,7 +98,7 @@ pub fn rail_ticks(
 /// The active tick for a scroll position: the last tick whose transcript row is
 /// at or above the viewport-top row (the prompt whose section you're reading).
 /// Before the first tick's row, the first tick is active.
-pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
+fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
     if tick_rows.is_empty() {
         return None;
     }
@@ -127,14 +124,14 @@ pub const RAIL_V_MARGIN: f32 = 24.0;
 pub const MAX_RAIL_TICKS: usize = 12;
 
 /// How many tick slots fit in a rail of `height` px (always ≥ 1).
-pub fn rail_capacity(height: f32) -> usize {
+fn rail_capacity(height: f32) -> usize {
     let usable = (height - 2.0 * RAIL_V_MARGIN).max(TICK_SLOT);
     (((usable + TICK_GAP) / (TICK_SLOT + TICK_GAP)).floor() as usize).max(1)
 }
 
 /// Slots the rail actually uses: what fits the viewport, hard-capped at
 /// [`MAX_RAIL_TICKS`] so the outline stays compact even on tall windows.
-pub fn rail_slots(height: f32) -> usize {
+fn rail_slots(height: f32) -> usize {
     rail_capacity(height).min(MAX_RAIL_TICKS)
 }
 
@@ -146,7 +143,7 @@ pub fn rail_slots(height: f32) -> usize {
 /// overflowing. Returns each bucket's `[start, end)` tick range; with
 /// `n <= capacity` every bucket is a single tick — the identity, i.e. the
 /// old per-prompt rail.
-pub fn tick_buckets(n: usize, capacity: usize) -> Vec<(usize, usize)> {
+fn tick_buckets(n: usize, capacity: usize) -> Vec<(usize, usize)> {
     if n == 0 {
         return Vec::new();
     }
@@ -155,14 +152,14 @@ pub fn tick_buckets(n: usize, capacity: usize) -> Vec<(usize, usize)> {
 }
 
 /// The bucket containing tick `ix` (for active/hover mapping).
-pub fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
+fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
     buckets.iter().position(|&(s, e)| ix >= s && ix < e)
 }
 
 /// Char-cap a preview with an ellipsis. Whitespace runs (including newlines —
 /// prompts and replies are free text) collapse to single spaces first: the
 /// preview card's title is a one-line surface (message-rail.tsx line-clamp-1).
-pub fn truncate_preview(text: &str, max_chars: usize) -> String {
+fn truncate_preview(text: &str, max_chars: usize) -> String {
     let flat = crate::transcript::single_line(text);
     if flat.chars().count() <= max_chars {
         return flat;
