@@ -1,6 +1,6 @@
 # D82 — detached chat-id work lacks exact generation binding
 
-**Status:** resolved in `fix/d82-detached-generation-binding`, merge pending.
+**Status:** merged [PR #223](https://github.com/matty/comet/pull/223).
 
 ## Auto-titling
 
