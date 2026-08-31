@@ -3842,7 +3842,7 @@
     },
     "a46b7010e67c4765482c086a801ba106f35db495": {
       "decision_date": "2026-08-30",
-      "local_commit": "02a6dc5c174fe31545c3b14d9f885f8350dfe047",
+      "local_commit": null,
       "note": "Adapted to current Comet card parity: Grok lifecycle emits SubagentStarted/SubagentUpdated and final wire output; upstream private disk tail, child documents, and tabs are not applicable because D54 deliberately keeps that architecture open and ACP must not outrun native providers.",
       "outcome": "adapted",
       "subject": "grok: subagent visualization over ACP \u2014 lifecycle wire events + disk-tailed transcripts",
@@ -5107,7 +5107,7 @@
     "d9f13cbd9ee2406e02333cf98aa3c789410b110b": {
       "decision_date": "2026-08-30",
       "local_commit": null,
-      "note": "Deferred during interactive review.",
+      "note": "Re-triaged: the old \"absent from this fork\" premise is false, and unlike its siblings in this lineage this mechanism is genuinely adapter-agnostic (keys only on core-ACP signals: streamed content, resolved tool calls, no pending question, then quiet past a window) — it could in principle apply to Grok or Hermes. Task-5's brief scopes this PR's hardening to the dual completion-signal settle (Step 2) and the prompt-send-to-first-frame stall bound (Step 4) only; a mid-turn quiet-settle for a dropped terminal reply is a different, broader mechanism this task was not asked to build. Deferred for a future slice to design and fixture deliberately, not folded in here as extra scope.",
       "outcome": "deferred",
       "subject": "ACP: blanket dropped-reply settle for every adapter",
       "upstream_sha": "d9f13cbd9ee2406e02333cf98aa3c789410b110b"
