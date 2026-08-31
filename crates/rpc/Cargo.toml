@@ -12,11 +12,9 @@ tokio-tungstenite.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-uuid.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 rand.workspace = true
@@ -24,11 +22,10 @@ subtle.workspace = true
 zeroize.workspace = true
 comet-identity.workspace = true
 rustls.workspace = true
-rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 x509-parser.workspace = true
 data-encoding.workspace = true
 
 [dev-dependencies]
-comet-identity.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
