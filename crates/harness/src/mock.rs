@@ -172,6 +172,20 @@ fn mock_approval(value: &str) -> Option<ApprovalRequest> {
     })
 }
 
+/// A `COMET_MOCK_*` on/off knob: set, non-empty, and not `0`.
+///
+/// The literal name stays at each call site on purpose — `every_mock_knob_is_documented`
+/// reads this file's source text to pin the register in `docs/testing/mock-states.md`.
+fn knob(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// A `COMET_MOCK_*` knob carrying a number. `None` covers unset and unparseable
+/// alike: a knob nobody can read is a knob nobody set.
+fn knob_num<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
 #[async_trait]
 impl Harness for MockHarness {
     fn id(&self) -> HarnessId {
@@ -211,10 +225,7 @@ impl Harness for MockHarness {
         // spaces the scripted events out so live-run UI states (working
         // indicator, streaming fade, trailing tool-group auto-open) are
         // observable. Unset (the default, and in tests) streams instantly.
-        let delay_ms = std::env::var("COMET_MOCK_DELAY_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let delay_ms = knob_num::<u64>("COMET_MOCK_DELAY_MS").unwrap_or(0);
         let delay = std::time::Duration::from_millis(delay_ms);
 
         // Dev/testing knob: `COMET_MOCK_QUESTION=1` swaps in a run that asks
@@ -222,9 +233,7 @@ impl Harness for MockHarness {
         // engine mints the request id, emits `InputRequested`, and resolves it
         // from the `RespondInput` doc command) — the only data-side way to put
         // the QuestionPanel on screen.
-        let question_mode = std::env::var("COMET_MOCK_QUESTION")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let question_mode = knob("COMET_MOCK_QUESTION");
         if question_mode {
             let request_input = controls.request_input;
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
@@ -332,9 +341,7 @@ impl Harness for MockHarness {
         // NOTHING — no result, no Done. A tool call that never returns has no
         // other data-side producer: every fake in this repo answers, which is
         // why the state has only ever been seen against a live provider.
-        let hang_mode = std::env::var("COMET_MOCK_HANG")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let hang_mode = knob("COMET_MOCK_HANG");
         if hang_mode {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             tokio::spawn(async move {
@@ -371,24 +378,16 @@ impl Harness for MockHarness {
         // before the final Done — long single-reply streams for frame-cost /
         // smoothness measurement (the terminal `Done` is emitted exactly once,
         // at the very end).
-        let repeat = std::env::var("COMET_MOCK_REPEAT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
+        let repeat = knob_num::<usize>("COMET_MOCK_REPEAT").unwrap_or(1).max(1);
         // Dev/testing knob: `COMET_MOCK_ERROR=1` appends a scripted error
         // before the terminal Done — the only data-side way to put the
         // transcript ErrorChip on screen with the mock harness.
-        let mock_error = std::env::var("COMET_MOCK_ERROR")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_error = knob("COMET_MOCK_ERROR");
         // Dev/testing knob: `COMET_MOCK_TABLE=1` appends scripted GFM tables
         // before the terminal Done — a plain 3-column grid plus a wide/uneven
         // one (long prose cell beside short cells, mixed alignment) for
         // table-styling checks against the reference app.
-        let mock_table = std::env::var("COMET_MOCK_TABLE")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_table = knob("COMET_MOCK_TABLE");
         let done_ix = self
             .script
             .iter()
@@ -403,9 +402,7 @@ impl Harness for MockHarness {
         // composer's context gauge on screen without driving a real CLI and
         // filling a real window. `0` suppresses it, which is also what a
         // provider that publishes no window looks like.
-        let context_event = std::env::var("COMET_MOCK_CONTEXT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let context_event = knob_num::<u64>("COMET_MOCK_CONTEXT")
             .filter(|percent| *percent > 0)
             .map(|percent| {
                 const WINDOW: u64 = 200_000;
@@ -418,9 +415,7 @@ impl Harness for MockHarness {
         // Dev/testing knob: `COMET_MOCK_CODE=1` appends rust + ts code blocks
         // (keywords, strings, numbers, comments) plus inline code — for
         // syntax-palette and inline-code styling checks against the reference.
-        let mock_code = std::env::var("COMET_MOCK_CODE")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_code = knob("COMET_MOCK_CODE");
         let code_event = mock_code.then(|| AgentEvent::TextDelta {
             text: concat!(
                 "\n### Code check\n\n",
@@ -462,9 +457,7 @@ impl Harness for MockHarness {
         // passage — bold-led list items, inline links, emphasis, strikethrough
         // — the shapes whose half-streamed markers the display mend
         // (crates/ui markdown/mend.rs) must hold steady while streaming.
-        let mock_mend = std::env::var("COMET_MOCK_MEND")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_mend = knob("COMET_MOCK_MEND");
         let mend_event = mock_mend.then(|| AgentEvent::TextDelta {
             text: concat!(
                 "\n### Streaming mend check\n\n",
@@ -494,9 +487,7 @@ impl Harness for MockHarness {
         // item with no `text` at all** is what a resumed run produces for a
         // task the previous process created (capture §7); a card that assumes
         // every row has a subject will render it as a blank line.
-        let mock_checklist = std::env::var("COMET_MOCK_CHECKLIST")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_checklist = knob("COMET_MOCK_CHECKLIST");
         let checklist_events = mock_checklist
             .then(|| {
                 let created = |id: &str, text: &str| AgentEvent::ChecklistItemChanged {
@@ -577,9 +568,7 @@ impl Harness for MockHarness {
         // `transcript.rs`'s
         // `a_running_subagent_in_a_finished_entry_reads_last_seen_running` is
         // still what PINS the state; this rig is how it gets onto a screen.
-        let mock_subagent = std::env::var("COMET_MOCK_SUBAGENT")
-            .ok()
-            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mock_subagent = knob("COMET_MOCK_SUBAGENT");
         let subagent_events = mock_subagent
             .then(|| {
                 let started = |task: &str, kind: &str, what: &str| AgentEvent::SubagentStarted {
@@ -724,10 +713,7 @@ impl Harness for MockHarness {
         // instead of whole scripted blocks — delta boundaries then land inside
         // inline markers and links, which is the streaming shape real
         // harnesses produce and the display mend exists for.
-        let chunk_chars = std::env::var("COMET_MOCK_CHARS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0);
+        let chunk_chars = knob_num::<usize>("COMET_MOCK_CHARS").filter(|&n| n > 0);
         let events: Vec<Result<AgentEvent, HarnessError>> = match chunk_chars {
             None => events,
             Some(n) => events
