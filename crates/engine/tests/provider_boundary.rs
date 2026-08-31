@@ -1,7 +1,5 @@
 //! Provider-process boundary coverage uses the real Codex harness fixture.
 
-#![allow(dead_code)] // Later D49 scenarios share this fixture's helpers.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,12 +14,12 @@ const SPACE: &str = "space-provider-boundary";
 const CHAT: &str = "chat-provider-boundary";
 
 struct EngineFixture {
+    client: RpcClient,
+    core: EngineCore,
+    cwd: PathBuf,
     _data_dir: tempfile::TempDir,
     _codex_home: tempfile::TempDir,
     _cwd_dir: tempfile::TempDir,
-    core: EngineCore,
-    client: RpcClient,
-    cwd: PathBuf,
 }
 
 impl EngineFixture {
@@ -77,6 +75,8 @@ fn codex_request(fixture: &EngineFixture, prompt: &str, mode: RuntimeMode) -> Ru
     }
 }
 
+// Tasks 2–4 consume this once their provider scenarios are added.
+#[allow(dead_code)]
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
@@ -91,6 +91,8 @@ where
     }
 }
 
+// Tasks 2–4 consume this once their provider scenarios are added.
+#[allow(dead_code)]
 fn commands(fixture: &EngineFixture) -> Vec<SessionCommandEntry> {
     fixture
         .core
@@ -102,6 +104,8 @@ fn commands(fixture: &EngineFixture) -> Vec<SessionCommandEntry> {
         .expect("read fixture commands")
 }
 
+// Tasks 2–4 consume this once their provider scenarios are added.
+#[allow(dead_code)]
 fn journal(fixture: &EngineFixture) -> Vec<JournaledEvent> {
     fixture
         .core
@@ -111,12 +115,14 @@ fn journal(fixture: &EngineFixture) -> Vec<JournaledEvent> {
         .0
 }
 
+// Tasks 2–4 consume this once their provider scenarios are added.
+#[allow(dead_code)]
 fn apply_message_frame(entries: &mut Vec<SessionMessageEntry>, frame: TranscriptFrame) {
     comet_doc::apply_transcript_frame(entries, frame).expect("apply transcript frame");
 }
 
 #[tokio::test]
-async fn fixture_owns_the_codex_home_and_manually_titled_workspace_chat() {
+async fn fixture_wires_codex_request_manual_title_and_rpc_harness_list() {
     let fixture = EngineFixture::new();
     let request = codex_request(&fixture, "fixture smoke", RuntimeMode::ApprovalRequired);
 
