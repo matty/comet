@@ -1,6 +1,6 @@
 # D81 — displaced runs escape the ownership census after bounded interruption
 
-**Status:** resolved in `fix/d81-displaced-run-ownership`, merge pending. This was deliberately
+**Status:** merged [PR #220](https://github.com/matty/comet/pull/220). This was deliberately
 outside Task 9's bounded repair and did not invalidate that delta's bounded PASS.
 
 ## What happens
