@@ -1,6 +1,6 @@
 //! Provider-process boundary coverage uses the real Codex harness fixture.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,4 +145,57 @@ async fn fixture_wires_codex_request_manual_title_and_rpc_harness_list() {
         .await
         .expect("list fixture harnesses");
     assert_eq!(harnesses[0]["id"], "codex");
+}
+
+#[tokio::test]
+async fn fake_codex_model_discovery_and_command_endpoint_cross_engine_rpc() {
+    let fixture = EngineFixture::new();
+
+    // Keep this untyped: the picker decodes this literal RPC reply, so a Rust
+    // round trip would miss a producer/consumer shape drift.
+    let models = fixture
+        .client
+        .call(
+            comet_rpc::methods::LIST_MODELS,
+            serde_json::json!({"harness": "codex"}),
+        )
+        .await
+        .expect("discover fake Codex models");
+    assert_eq!(models["source"], "live");
+    assert!(
+        models["models"]
+            .as_array()
+            .expect("models array on the wire")
+            .iter()
+            .any(|model| model["id"] == "gpt-5.7-nova"),
+        "fake-only model must cross the harness and engine RPC boundary: {models}"
+    );
+    let home_label = models["models"]
+        .as_array()
+        .expect("models array on the wire")
+        .iter()
+        .find(|model| model["id"] == "codex-home-echo")
+        .expect("Codex home echo model on the wire")["label"]
+        .as_str()
+        .expect("Codex home echo label");
+    assert_eq!(
+        Path::new(home_label)
+            .canonicalize()
+            .expect("canonicalize child Codex home"),
+        fixture
+            ._codex_home
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture Codex home")
+    );
+
+    let commands = fixture
+        .client
+        .call(
+            comet_rpc::methods::LIST_COMMANDS,
+            serde_json::json!({"harness": "codex", "cwd": fixture.cwd}),
+        )
+        .await
+        .expect("list fake Codex commands");
+    assert_eq!(commands["commands"], serde_json::json!([]));
 }
