@@ -152,22 +152,19 @@ fn user_text(line: &str) -> Option<String> {
 }
 
 /// D43: records the full argv this invocation actually received (minus
-/// argv[0], the fixture's own path, which varies per build) and this
-/// process's own actual working directory to the file named in the marker —
-/// not the values Comet believes it sent, the values the OS actually handed
-/// this child. `check_run_flags` above already fails loudly when a required
-/// flag is MISSING; this is for the flags whose VALUE varies per request
-/// (`--model`, `--effort`, `--settings`, `--resume=`) and for `cwd`, which
-/// `LaunchDescriptor::command`'s `current_dir` call sets on the `Command` but
-/// which nothing previously checked actually took effect on the spawned
-/// process — the gap D43 names as "weaker than command discovery's
-/// child-side cwd echo".
-fn launch_record(path: &str) {
+/// argv[0], the fixture's own path, which varies per build), this process's
+/// actual working directory, and its first stdin frame to the file named in
+/// the marker — not the values Comet believes it sent, the values the OS
+/// actually handed this child. `check_run_flags` above already fails loudly
+/// when a required flag is MISSING; this is for the flags whose VALUE varies
+/// per request (`--model`, `--effort`, `--settings`, `--resume=`), `cwd`, and
+/// the first message's attachment blocks.
+fn launch_record(path: &str, first: &str) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<none>".into());
-    let record = serde_json::json!({ "args": args, "cwd": cwd });
+    let record = serde_json::json!({ "args": args, "cwd": cwd, "first": first });
     std::fs::write(path, record.to_string()).expect("write launch record");
     emit(
         r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-launch-record"}"#,
@@ -298,7 +295,7 @@ fn main() {
         .as_deref()
         .and_then(|text| text.strip_prefix("scenario:launch-record|"))
     {
-        launch_record(path);
+        launch_record(path, &first);
         return;
     }
 
