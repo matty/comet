@@ -286,21 +286,35 @@ pub fn sanitize_dir(
         "command": command,
         "exit_code": capture.exit_code,
     });
-    // D91's residual: `CLAUDE_CONFIG_DIR`'s presence in `command.configured_env` already IS the
-    // isolation signal, but nothing named it as one -- a reader has to know that convention to
-    // use it, and every other check in this file reads a *named* field, never "is this key
-    // missing from a generic env map." This turns that implicit fact into an explicit claim.
+    // D91's residual: `CLAUDE_CONFIG_DIR`'s presence in `command.configured_env` already IS a
+    // deliberate-isolation signal, but nothing named it as one -- a reader has to know that
+    // convention to use it, and every other check in this file reads a *named* field, never "is
+    // this key missing from a generic env map." This turns that implicit fact into an explicit
+    // claim, but ONLY in the direction the rig can actually vouch for.
     //
-    // Claude-only: the concept doesn't apply to a Codex or ACP capture, so the field is omitted
-    // there rather than given a third "not applicable" value that could be misread as either real
-    // answer. It is also omitted, by construction, from every manifest promoted before this field
-    // existed (`claude/2.1.228`, `.229`, `.233`, and the `claude/2.1.241` pair) -- absence there
-    // means the isolation state was never recorded, not that the capture was ambient. Some of
-    // those captures (`2.1.241/{model-discovery,command-discovery}`) were in fact isolated; the
-    // manifest just didn't say so under this name yet, and a reader who needs to know for one of
-    // them still has `command.configured_env` to read directly, exactly as before this field
-    // existed. See `.agents/rules/optional-wire-fields.md` on writing the absent case as
-    // "unknown," never as "not isolated."
+    // "isolated" when this key is present: the rig itself passed `--claude-config-dir`, which is
+    // observable with certainty (`derive_launch` in `record.rs` sets it). There is deliberately
+    // no "ambient" counterpart. `comet_harness::launch::LaunchDescriptor::spawn`
+    // (`crates/harness/src/launch.rs`) calls `.envs(&self.configured_env)` on a `Command` that is
+    // never `.env_clear()`-ed, so an unconfigured child still inherits the *recorder process's
+    // own* ambient `CLAUDE_CONFIG_DIR` if the operator happens to have one exported in their
+    // shell -- and `sanitize_dir` runs later, often in a different process, so it cannot see what
+    // that ambient value was even in principle. Stamping that case "ambient" would publish a claim
+    // the rig cannot back up: a capture that in fact inherited a real, non-empty
+    // `CLAUDE_CONFIG_DIR` from the capturer's shell would read as isolated-by-omission, which is
+    // the exact false reassurance D91 exists to stop the archive from making. "unknown" is the
+    // honest value for every case the rig cannot rule out, and it collapses with the plain-absent
+    // case on the 42 manifests promoted before this field existed -- both mean "nobody recorded
+    // this," which is the truth on both sides. See `.agents/rules/optional-wire-fields.md` on
+    // writing the absent case as "unknown," never as a specific answer the evidence doesn't
+    // support.
+    //
+    // Do not "simplify" this back to a two-value `isolated`/`ambient` enum: that is the exact
+    // regression this comment exists to block, and the rig's env-inheritance model (above) is why
+    // it would be wrong, not merely less informative.
+    //
+    // Non-Claude (Codex, ACP): the concept doesn't apply at all, so the field is omitted rather
+    // than given a third value that could be misread as either real answer.
     if capture.provider == Provider::Claude {
         let isolation = if capture
             .command
@@ -309,7 +323,7 @@ pub fn sanitize_dir(
         {
             "isolated"
         } else {
-            "ambient"
+            "unknown"
         };
         manifest
             .as_object_mut()

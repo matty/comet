@@ -345,29 +345,38 @@ fn a_program_under_an_existing_root_keeps_that_roots_spelling() {
     );
 }
 
-/// D91's residual: the manifest must say plainly whether a Claude capture ran against an
-/// isolated `CLAUDE_CONFIG_DIR` or the capturer's ambient one, rather than leaving a reader to
-/// infer it from whether `command.configured_env` happens to carry that key.
+/// D91's residual: the manifest must say plainly whether a Claude capture's launch was
+/// configured with an isolated `CLAUDE_CONFIG_DIR`, rather than leaving a reader to infer it from
+/// whether `command.configured_env` happens to carry that key.
 ///
-/// `write_raw_capture`'s fixture is Claude with an empty `configured_env` -- ambient by
-/// construction, since nothing recorded `--claude-config-dir` for it.
+/// Deliberately NOT named "ambient": `write_raw_capture`'s fixture has an empty `configured_env`,
+/// meaning the rig did not pass `--claude-config-dir` -- but the rig cannot see whether the
+/// spawned child inherited an ambient `CLAUDE_CONFIG_DIR` from the capturer's own shell
+/// (`LaunchDescriptor::spawn` never calls `.env_clear()`). Calling this case "ambient" would be a
+/// claim the evidence doesn't support; "unknown" is the honest one. See the production comment
+/// beside `claude_config_isolation` in `sanitize.rs` for the full reasoning.
 #[test]
-fn sanitizer_manifest_records_ambient_claude_config_isolation() {
+fn sanitizer_manifest_records_unknown_claude_config_isolation_when_unconfigured() {
     let temp = tempfile::tempdir().unwrap();
     let raw = write_raw_capture(
         temp.path(),
-        "ambient-claude-config",
+        "unconfigured-claude-config",
         &[r#"{"type":"control_response","response":{"subtype":"success"}}"#],
     );
 
-    let report = sanitize_dir(&raw, &staging_dir(temp.path(), "ambient-claude-config")).unwrap();
+    let report = sanitize_dir(
+        &raw,
+        &staging_dir(temp.path(), "unconfigured-claude-config"),
+    )
+    .unwrap();
     let manifest: Value = serde_json::from_slice(&report.manifest_bytes).unwrap();
 
-    assert_eq!(manifest["claude_config_isolation"], "ambient");
+    assert_eq!(manifest["claude_config_isolation"], "unknown");
 }
 
 /// The other half: a Claude capture whose launch carried `CLAUDE_CONFIG_DIR` must be marked
-/// `"isolated"`, distinguishably from the ambient case above.
+/// `"isolated"`, distinguishably from the unknown case above -- this is the one case the rig can
+/// vouch for with certainty, since it set the variable itself.
 #[test]
 fn sanitizer_manifest_records_isolated_claude_config_isolation() {
     let temp = tempfile::tempdir().unwrap();
@@ -396,7 +405,7 @@ fn sanitizer_manifest_records_isolated_claude_config_isolation() {
 }
 
 /// The field is Claude-only: the concept has no meaning for a Codex or ACP capture, and a
-/// spurious `"ambient"` there would read as a claim about a scenario that was never in question.
+/// spurious `"unknown"` there would read as a claim about a scenario that was never in question.
 #[test]
 fn sanitizer_manifest_omits_claude_config_isolation_for_a_non_claude_capture() {
     let temp = tempfile::tempdir().unwrap();
