@@ -153,6 +153,10 @@ fn mock_approval(value: &str) -> Option<ApprovalRequest> {
         "mcp" => ApprovalRequest::Mcp {
             server: "linear".into(),
             tool: "create_issue".into(),
+            arguments: comet_proto::McpArgumentMetadata::from_json(&serde_json::json!({
+                "project": "COMET",
+                "title": "Test MCP approval"
+            })),
         },
         "unknown" => ApprovalRequest::Unknown {
             summary: "an action Comet does not model".into(),
@@ -939,7 +943,10 @@ mod tests {
         ));
         assert!(matches!(
             mock_approval("mcp"),
-            Some(ApprovalRequest::Mcp { .. })
+            Some(ApprovalRequest::Mcp {
+                arguments: Some(_),
+                ..
+            })
         ));
         assert!(matches!(
             mock_approval("unknown"),

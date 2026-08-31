@@ -355,7 +355,22 @@ fn approval_chip_content_raw(approval: &crate::ApprovalRequest) -> (&'static str
             format!("{path} · +{added_lines} −{removed_lines}"),
         ),
         ApprovalRequest::FileRead { path } => ("Read a file", path.clone()),
-        ApprovalRequest::Mcp { server, tool } => ("Use an MCP tool", format!("{server} · {tool}")),
+        ApprovalRequest::Mcp {
+            server,
+            tool,
+            arguments,
+        } => (
+            "Use an MCP tool",
+            match arguments
+                .as_ref()
+                .filter(|value| value.has_valid_identity())
+            {
+                Some(arguments) => {
+                    format!("{server} · {tool} · {}", arguments.bounded_preview())
+                }
+                None => format!("{server} · {tool}"),
+            },
+        ),
         ApprovalRequest::Unknown { summary } => ("Permission needed", summary.clone()),
     }
 }
@@ -650,9 +665,23 @@ mod tests {
         let (label, detail) = approval_chip_content(&ApprovalRequest::Mcp {
             server: "linear".into(),
             tool: "create_issue".into(),
+            arguments: None,
         });
         assert_eq!(label, "Use an MCP tool");
         assert_eq!(detail, "linear · create_issue");
+
+        let (_, detail) = approval_chip_content(&ApprovalRequest::Mcp {
+            server: "linear".into(),
+            tool: "create_issue".into(),
+            arguments: Some(crate::McpArgumentMetadata {
+                identity: format!("sha256:{}", "a".repeat(64)),
+                preview: "{\"project\":\"COMET\"}".into(),
+            }),
+        });
+        assert_eq!(
+            detail, "linear · create_issue · {\"project\":\"COMET\"}",
+            "the bounded preview is secondary detail on the existing card"
+        );
 
         let (label, detail) = approval_chip_content(&ApprovalRequest::Unknown {
             summary: "an action Comet does not model".into(),

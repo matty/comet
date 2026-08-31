@@ -58,7 +58,14 @@ use serde::{Deserialize, Serialize};
 ///     plane in `SessionCommandPayload::RespondApproval` and the transcript
 ///     stream inside `MessagePart::Approval`. Both containing values decode
 ///     all-or-nothing, so an older peer cannot skip the unfamiliar variant.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: `ApprovalRequest::Mcp.arguments`. The field is additive, but an older
+///     client silently ignores both the argument preview and identity while
+///     still offering its v11 "Allow for this session" action. The new host
+///     would enforce that grant against the exact digest, but the user would
+///     have granted an argument set the old client never showed. Refusing the
+///     pair preserves informed approval instead of treating exact enforcement
+///     as a substitute for a visible request.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -283,6 +290,11 @@ mod tests {
         let b = ServerRef::new(ServerId::new("sha256:b"), "chat-1");
         assert_ne!(a, b);
         assert_eq!(a.local_id(), "chat-1");
+    }
+
+    #[test]
+    fn mcp_argument_identity_requires_protocol_version_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
     }
 
     #[test]

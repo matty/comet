@@ -2596,6 +2596,144 @@ async fn allow_for_session_answers_the_next_identical_request_without_asking() {
     );
 }
 
+/// Repeats one MCP request with reordered object keys, then changes one
+/// argument. The first repeat must consume the session grant; the changed call
+/// must park for its own decision.
+struct McpGrantScopeHarness;
+
+#[async_trait]
+impl Harness for McpGrantScopeHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "McpGrantScope"
+    }
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities::default()
+    }
+    async fn models(&self) -> Result<ModelCatalog, HarnessError> {
+        Ok(ModelCatalog::built_in(vec![]))
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let request_approval = controls.request_approval;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        tokio::spawn(async move {
+            let request = |arguments: serde_json::Value| ApprovalRequest::Mcp {
+                server: "linear".into(),
+                tool: "create_issue".into(),
+                arguments: comet_proto::McpArgumentMetadata::from_json(&arguments),
+            };
+            let first = request_approval(request(serde_json::json!({
+                "project": "COMET",
+                "labels": ["bug", "urgent"]
+            })))
+            .await;
+            let repeated = request_approval(request(serde_json::json!({
+                "labels": ["bug", "urgent"],
+                "project": "COMET"
+            })))
+            .await;
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: format!("repeat: {first:?} then {repeated:?}"),
+            });
+            let changed = request_approval(request(serde_json::json!({
+                "labels": ["bug", "urgent"],
+                "project": "OTHER"
+            })))
+            .await;
+            let _ = tx.send(AgentEvent::TextDelta {
+                text: format!("changed: {changed:?}"),
+            });
+            let _ = tx.send(done(DoneStatus::Completed));
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_session_grants_match_canonical_arguments_and_reject_changed_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(McpGrantScopeHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    let first_id = drive_to_open_approval(&core, &handle, "cmd-mcp-grant").await;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-mcp-grant-answer",
+        SessionCommandPayload::RespondApproval {
+            request_id: first_id.clone(),
+            decision: ApprovalDecision::AllowForSession,
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.parts.iter().any(|part| {
+                    matches!(part, MessagePart::Text { text, .. } if text.contains("repeat: Ok(AllowForSession) then Ok(AllowForSession)"))
+                })
+            })
+        },
+        "the canonical repeat to auto-allow",
+    )
+    .await;
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).map(|state| state.status)
+                == Some(SessionStatus::AwaitingInput)
+        },
+        "the changed MCP arguments to ask again",
+    )
+    .await;
+
+    let changed_id = entries_now(&core)
+        .iter()
+        .flat_map(|entry| entry.parts.iter())
+        .find_map(|part| match part {
+            MessagePart::Approval {
+                request_id,
+                approval:
+                    ApprovalRequest::Mcp {
+                        arguments: Some(arguments),
+                        ..
+                    },
+                decision: None,
+                ..
+            } if request_id != &first_id && arguments.preview.contains("OTHER") => {
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .expect("changed arguments stay pending with their own visible preview");
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-mcp-changed-answer",
+        SessionCommandPayload::RespondApproval {
+            request_id: changed_id,
+            decision: ApprovalDecision::Allow,
+        },
+    );
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|entry| {
+                entry.parts.iter().any(|part| {
+                    matches!(part, MessagePart::Text { text, .. } if text.contains("changed: Ok(Allow)"))
+                })
+            })
+        },
+        "the changed request to resolve independently",
+    )
+    .await;
+}
+
 /// Asks permission and then takes a steer instead of an answer — what a user
 /// typing over an open card produces, and what claude emits the moment a steer
 /// line is queued. Reports what the parked request finally resolved to, so a
