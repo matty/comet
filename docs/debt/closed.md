@@ -1,32 +1,8 @@
 # Closed debt
 
-Kept for the reasoning, not the status. `README.md` carries each row's current
-state and PR. Delete an entry only if its
+Kept for the reasoning, not the status. Each of these merged;
+`README.md` carries the row and the PR. Delete an entry only if its
 explanation stops being useful to someone reading the code it touched.
-
-## D136 — orphan Codex turn notifications
-
-The fix is stacked on D135's [PR #226](https://github.com/matty/comet/pull/226),
-which protects the same Codex notification loop from duplicate terminal frames.
-After `turn/completed`, a turn-scoped provider notification has no transcript
-owner. Comet drops it rather than buffering it for a later turn or inventing an
-unattached transcript event, either of which would misattribute old provider
-content to a user request.
-
-The ownership gate is deliberately narrow: it covers only
-`item/agentMessage/delta`, `item/reasoning/textDelta`,
-`item/reasoning/summaryTextDelta`, `turn/plan/updated`, `item/started`,
-`item/completed`, and `thread/tokenUsage/updated`. Session-scoped
-`account/rateLimits/updated`, `mcpServer/*`, and
-`thread/environment/disconnected` notices remain deliverable after completion.
-The real spawned fake-Codex regression
-`codex_orphaned_turn_events_after_done_are_dropped_but_session_notices_survive`
-proves the boundary: it receives one completed `Done`, then the post-completion
-85% rate-limit notice, and no orphaned text delta.
-
-No `PROTOCOL_VERSION` change is needed. The fix neither changes a wire shape
-nor expands an event or consumer contract; it drops provider content that has
-no valid owner before it reaches the existing consumer.
 
 ## D36 — provider default reasoning
 
