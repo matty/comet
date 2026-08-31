@@ -54,7 +54,11 @@ use serde::{Deserialize, Serialize};
 ///     `HarnessId` still carries no `#[serde(other)]` arm, so an older peer
 ///     meeting `"hermes"` fails the whole containing value — a harness list,
 ///     a chat row, or a `RunRequest` — not one field.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// 11: `ApprovalDecision::DenyAndInterrupt`. This decision crosses the command
+///     plane in `SessionCommandPayload::RespondApproval` and the transcript
+///     stream inside `MessagePart::Approval`. Both containing values decode
+///     all-or-nothing, so an older peer cannot skip the unfamiliar variant.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

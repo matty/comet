@@ -257,6 +257,8 @@ impl ClaudeHarness {
             // `deny_response(message)` puts the user's note on the provider
             // wire, so the adapter can truthfully advertise this capability.
             carries_deny_note: true,
+            // Claude's approval response has no deny-and-interrupt decision.
+            supports_approval_interrupt: false,
             // Claude Code names no chat on its wire; Comet titles it.
             self_titles: false,
         }
@@ -852,6 +854,9 @@ fn handle_control_request(
                 allow_response(req.request.input)
             }
             Ok(ApprovalDecision::Deny { message }) => deny_response(message),
+            // The engine rejects this unsupported decision for Claude. A
+            // direct caller still fails closed rather than granting the tool.
+            Ok(ApprovalDecision::DenyAndInterrupt { message }) => deny_response(message),
             // Expired, or a dropped resolver: the user never answered and
             // never will. Not approved.
             Ok(ApprovalDecision::Expired) | Err(_) => {
@@ -1353,6 +1358,8 @@ mod command_tests {
     /// The deny arm puts the note on the wire, so the composer may promise it.
     #[test]
     fn claude_carries_a_deny_note() {
-        assert!(ClaudeHarness::capabilities().carries_deny_note);
+        let capabilities = ClaudeHarness::capabilities();
+        assert!(capabilities.carries_deny_note);
+        assert!(!capabilities.supports_approval_interrupt);
     }
 }

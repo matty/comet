@@ -392,6 +392,8 @@ fn main() {
         cwd_echo(&tid);
     } else if turn_line.contains("scenario:approve") {
         approve(&mut stdin, &turn_line, &thread_line, &tid);
+    } else if turn_line.contains("scenario:cancel-approval") {
+        cancel_approval(&mut stdin, &tid);
     } else if turn_line.contains("scenario:decline") {
         decline(&mut stdin, &tid);
     } else if turn_line.contains("scenario:interrupt")
@@ -758,6 +760,28 @@ fn decline(stdin: &mut StdinLock<'_>, tid: &str) {
         return;
     }
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+}
+
+/// Codex's native approval `cancel`: reject the action and interrupt the turn
+/// in one server-request response. The terminal shape is the one recorded in
+/// D44 — `turn/completed` with `turn.status: "interrupted"`, not
+/// `turn/aborted` and not a separate client `turn/interrupt` request.
+fn cancel_approval(stdin: &mut StdinLock<'_>, tid: &str) {
+    emit(&format!(
+        r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
+    ));
+    emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"id":202,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /"}}"#,
+    );
+    let reply = read_line(stdin);
+    if !(reply.contains(r#""id":202"#) && reply.contains(r#""decision":"cancel""#)) {
+        emit(
+            r#"{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected cancel"}}}}"#,
+        );
+        return;
+    }
+    emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1","status":"interrupted"}}}"#);
 }
 
 fn interrupt(stdin: &mut StdinLock<'_>, tid: &str) {

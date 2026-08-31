@@ -374,6 +374,9 @@ impl CodexHarness {
             // are bare literals — the wire carries `"decline"` and nothing
             // else, so a note has no field to travel in (`docs/debt/README.md` D24).
             carries_deny_note: false,
+            // Both approval decision enums accept `"cancel"`, which denies
+            // the action and interrupts the requesting turn.
+            supports_approval_interrupt: true,
             // codex app-server names no chat on its wire; Comet titles it.
             self_titles: false,
         }
@@ -963,7 +966,21 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         let error = turn_error_message(&params);
-                        let status = if interrupted {
+                        // `cancel` is an approval RESPONSE, not Comet's
+                        // `turn/interrupt` request, so it never trips the
+                        // local interrupt token. D44 records that Codex can
+                        // report an interrupted turn as a completed
+                        // notification whose own status is `interrupted`, so
+                        // the provider's terminal state is authoritative no
+                        // matter which interrupt route produced it. Ignoring
+                        // that state turns "Deny & stop" into a clean
+                        // completion.
+                        let provider_interrupted = params
+                            .get("turn")
+                            .and_then(|turn| turn.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("interrupted");
+                        let status = if interrupted || provider_interrupted {
                             DoneStatus::Interrupted
                         } else if error.is_some() {
                             DoneStatus::Errored
@@ -1434,10 +1451,7 @@ fn handle_server_request(
         let decision = (request_approval)(request)
             .await
             .unwrap_or(ApprovalDecision::Expired);
-        client.respond(
-            &id,
-            json!({ "decision": approval::decision_literal(&decision) }),
-        );
+        client.respond(&id, approval::decision_response(&decision));
     });
     None
 }
@@ -1591,5 +1605,10 @@ mod tests {
     #[test]
     fn codex_cannot_carry_a_deny_note() {
         assert!(!CodexHarness::capabilities().carries_deny_note);
+    }
+
+    #[test]
+    fn codex_declares_native_approval_interrupt_support() {
+        assert!(CodexHarness::capabilities().supports_approval_interrupt);
     }
 }

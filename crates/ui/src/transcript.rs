@@ -537,7 +537,8 @@ impl ApprovalPaint {
             Some(ApprovalDecision::Allow) | Some(ApprovalDecision::AllowForSession) => {
                 ApprovalPaint::Allowed
             }
-            Some(ApprovalDecision::Deny { .. }) => ApprovalPaint::Denied,
+            Some(ApprovalDecision::Deny { .. })
+            | Some(ApprovalDecision::DenyAndInterrupt { .. }) => ApprovalPaint::Denied,
             Some(ApprovalDecision::Expired) => ApprovalPaint::Expired,
         }
     }
@@ -914,15 +915,16 @@ fn is_agent_spawn_chip(part: &MessagePart) -> bool {
 }
 
 /// D14's residual: the text (if any) that earns its own `DenyNote` row beside
-/// a decided `ApprovalCard`. `Some` only for `Deny`, and for whatever message
-/// it carries — including the composer's own "the user declined this action"
-/// default when no note was typed. That default is still exactly what was
-/// sent to the model, so showing it is the honest answer; guessing which
-/// messages count as "a real note" would need a second source of truth this
-/// part does not carry.
+/// a decided `ApprovalCard`. `Some` only for the two denial decisions, and for
+/// whatever message each carries — including the composer's own "the user
+/// declined this action" default when no note was typed. That default is still
+/// durable chat context even when Codex's bare decision literal cannot deliver
+/// it to the model; guessing which messages count as "a real note" would need
+/// a second source of truth this part does not carry.
 fn deny_note_text(decision: Option<&comet_proto::ApprovalDecision>) -> Option<SharedString> {
     match decision {
-        Some(comet_proto::ApprovalDecision::Deny { message }) => {
+        Some(comet_proto::ApprovalDecision::Deny { message })
+        | Some(comet_proto::ApprovalDecision::DenyAndInterrupt { message }) => {
             Some(SharedString::from(single_line(message)))
         }
         _ => None,
@@ -5498,6 +5500,31 @@ mod tests {
             let rows = rows_for_entry(&entry, false, &mut parse);
             assert_eq!(rows.len(), 1, "no deny-note row for a non-denial decision");
         }
+    }
+
+    #[test]
+    fn deny_and_interrupt_keeps_the_note_and_names_the_stopped_turn() {
+        let entry = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![approval_part(
+                "ap-r1",
+                Some(comet_proto::ApprovalDecision::DenyAndInterrupt {
+                    message: "do not continue".into(),
+                }),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2, "the decided card plus its durable note");
+        let RowKind::ApprovalCard { state, paint, .. } = &rows[0].kind else {
+            panic!("expected approval card");
+        };
+        assert_eq!(state.as_deref(), Some("Denied and stopped"));
+        assert_eq!(*paint, ApprovalPaint::Denied);
+        let RowKind::DenyNote { message } = &rows[1].kind else {
+            panic!("expected deny note");
+        };
+        assert_eq!(message.as_ref(), "do not continue");
     }
 
     /// `Expired` paints differently (amber, a state to resolve) but must NOT

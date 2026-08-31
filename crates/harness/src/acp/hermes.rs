@@ -438,6 +438,7 @@ impl HermesHarness {
             // send nothing a message could ride in either — checked against
             // source per Step 5's instruction, not assumed (D24).
             carries_deny_note: false,
+            supports_approval_interrupt: false,
             // No `session_info_update` (or anything else naming the chat) has
             // been observed from Hermes — its module doc already records that
             // it carries no steering extension and no effort ladder, and a
@@ -931,6 +932,7 @@ mod tests {
         let capabilities = HermesHarness::capabilities();
         assert_eq!(capabilities.runtime_modes, vec![RuntimeMode::FullAccess]);
         assert!(capabilities.reasoning_levels.is_empty());
+        assert!(!capabilities.supports_approval_interrupt);
         assert_eq!(
             capabilities.steering_mode,
             SteeringMode::TurnBoundary,

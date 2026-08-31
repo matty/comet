@@ -417,6 +417,9 @@ mod tests {
             ApprovalDecision::Deny {
                 message: "no".into(),
             },
+            ApprovalDecision::DenyAndInterrupt {
+                message: "stop".into(),
+            },
             ApprovalDecision::Expired,
         ] {
             let t = vec![assistant(

@@ -163,6 +163,8 @@ fn kind_for(decision: &ApprovalDecision) -> Option<&'static str> {
         ApprovalDecision::Allow => Some(ALLOW_ONCE),
         ApprovalDecision::AllowForSession => Some(ALLOW_ALWAYS),
         ApprovalDecision::Deny { .. } => Some(REJECT_ONCE),
+        // No ACP option promises that rejecting it interrupts the whole turn.
+        ApprovalDecision::DenyAndInterrupt { .. } => None,
         ApprovalDecision::Expired => None,
     }
 }

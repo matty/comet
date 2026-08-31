@@ -145,6 +145,9 @@ struct HarnessSessionRef {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    /// Whether this run's provider can deny an approval and interrupt the turn
+    /// as one atomic provider decision.
+    supports_approval_interrupt: bool,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -785,6 +788,7 @@ impl SessionsEngine {
         let run_handle = RunHandle {
             run_id: run_id.clone(),
             steerable: harness.capabilities().supports_steering,
+            supports_approval_interrupt: harness.capabilities().supports_approval_interrupt,
             steer_tx,
             interrupt_token,
             cancel: cancel_tx,
@@ -1119,11 +1123,23 @@ impl SessionsEngine {
                 h.pending_approvals.clone(),
                 h.session_allowed.clone(),
                 h.engine_tx.clone(),
+                h.supports_approval_interrupt,
             )
         });
-        let Some((pending, session_allowed, engine_tx)) = target else {
+        let Some((pending, session_allowed, engine_tx, supports_approval_interrupt)) = target
+        else {
             return Ok(false);
         };
+        if matches!(decision, ApprovalDecision::DenyAndInterrupt { .. })
+            && !supports_approval_interrupt
+        {
+            tracing::warn!(
+                chat_id,
+                request_id,
+                "approval interrupt rejected: active harness does not support it"
+            );
+            return Ok(false);
+        }
         // One critical section, and `pending` is held across the write to
         // `session_allowed` — the same lock order `park_unless_session_allows`
         // takes, and for the reason documented there: a request being minted
@@ -3291,6 +3307,7 @@ mod tests {
             handle: RunHandle {
                 run_id: run_id.to_string(),
                 steerable: false,
+                supports_approval_interrupt: false,
                 steer_tx,
                 interrupt_token: CancellationToken::new(),
                 cancel,
@@ -3567,6 +3584,7 @@ mod tests {
         RunHandle {
             run_id: "r1".into(),
             steerable: false,
+            supports_approval_interrupt: false,
             steer_tx,
             interrupt_token: CancellationToken::new(),
             cancel,
@@ -3576,6 +3594,67 @@ mod tests {
             minted_approvals: Arc::new(Mutex::new(HashSet::new())),
             session_allowed: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// A forged LAN command must not make an unsupported provider receive a
+    /// semantic promise it cannot keep. Returning false leaves the resolver in
+    /// the map, so the composer's existing safety net restores the decision
+    /// row instead of retiring it forever.
+    #[test]
+    fn unsupported_deny_and_interrupt_leaves_the_approval_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = engine(dir.path());
+        let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let (resolver, mut approval_rx) = oneshot::channel();
+        lock(&pending_approvals).insert(
+            "approval-1".into(),
+            PendingApproval {
+                signature: None,
+                resolver,
+                parked_at: Utc::now(),
+            },
+        );
+        let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        lock(&sessions.inner.runs).insert(
+            "chat-1".into(),
+            RunHandle {
+                run_id: "run-1".into(),
+                steerable: false,
+                supports_approval_interrupt: false,
+                steer_tx,
+                interrupt_token: CancellationToken::new(),
+                cancel,
+                engine_tx,
+                pending_inputs,
+                pending_approvals: pending_approvals.clone(),
+                minted_approvals: Arc::new(Mutex::new(HashSet::new())),
+                session_allowed: Arc::new(Mutex::new(HashSet::new())),
+            },
+        );
+
+        assert!(
+            !sessions
+                .respond_approval(
+                    "chat-1",
+                    "approval-1",
+                    ApprovalDecision::DenyAndInterrupt {
+                        message: "stop this turn".into(),
+                    },
+                )
+                .unwrap()
+        );
+        assert!(lock(&pending_approvals).contains_key("approval-1"));
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            engine_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     /// `blocked_since` untested by any e2e test: the `None` case (nothing
