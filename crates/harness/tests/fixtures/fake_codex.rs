@@ -1054,10 +1054,8 @@ fn stream_before_ack(tid: &str) {
 /// D48 selection: a notification that names no active turn and nothing
 /// queued, arriving AFTER `turn/completed`, while the session stays open for
 /// more steering (nothing failed and the mailbox is not dropped).
-/// `run_session`'s main loop has no gate on `router.active.is_some()` before
-/// decoding and forwarding a notification — see this scenario's driving
-/// test for the exact arm and why this documents CURRENT behavior, not an
-/// invariant the harness actually enforces.
+/// The following rate-limit update is deliberately session-scoped; the
+/// trailing delta is not. The regression test distinguishes them after Done.
 fn orphan_notification_after_completion(tid: &str) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
@@ -1065,6 +1063,9 @@ fn orphan_notification_after_completion(tid: &str) {
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"done"}}"#);
     emit(r#"{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}"#);
+    emit(
+        r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":85}}}}"#,
+    );
     // Belongs to no turn: router.active is None here and nothing is queued.
     emit(r#"{"method":"item/agentMessage/delta","params":{"itemId":"orphan","delta":"orphaned"}}"#);
 }

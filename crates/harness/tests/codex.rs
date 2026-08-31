@@ -1565,19 +1565,8 @@ async fn turn_events_streamed_ahead_of_their_own_ack_are_not_lost_or_reordered()
     assert_eq!(events.len(), 4, "extra or missing events: {events:?}");
 }
 
-/// D48 known gap: `run_session`'s main loop has no gate on
-/// `router.active.is_some()` before decoding and forwarding a notification.
-/// A persistent session (steering stays open after a turn completes, per
-/// `codex/mod.rs`'s own module doc) can receive a stray event that names no
-/// turn and answers no queued steer — a genuinely orphaned notification —
-/// and it still becomes a normal `TextDelta` in the consumer's stream, AFTER
-/// the `Done` that ended the turn it has nothing to do with. This documents
-/// CURRENT behavior (a real gap against D48's own "no normal event follows a
-/// terminal result" invariant), not a fix — fixing it needs a change in
-/// `crates/harness/src/codex/mod.rs`'s notification arms, out of scope for a
-/// tests-only slice. See this PR's description for the proposed debt row.
 #[tokio::test]
-async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
+async fn codex_orphaned_turn_events_after_done_are_dropped_but_session_notices_survive() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(
         &harness(),
@@ -1597,12 +1586,8 @@ async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
         }),
         "{events:?}"
     );
-    let done_pos = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::Done { .. }))
-        .expect("a Done for the completed turn");
     assert_eq!(
-        events.get(done_pos),
+        events.get(2),
         Some(&AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -1611,21 +1596,24 @@ async fn codex_an_orphaned_notification_after_done_is_not_dropped_today() {
         }),
         "{events:?}"
     );
-    // The known gap: a normal event, owned by no turn, still reaches the
-    // consumer AFTER the Done that ended the only turn this run ever had.
     assert_eq!(
-        events.get(done_pos + 1),
-        Some(&AgentEvent::TextDelta {
-            text: "orphaned".into()
+        events.get(3),
+        Some(&AgentEvent::Notice {
+            kind: NoticeKind::RateLimit,
+            severity: NoticeSeverity::Warning,
+            summary: "Codex usage is at 85% of its limit".into(),
+            detail: None,
+            key: Some("rateLimit".into()),
         }),
-        "expected the orphaned delta to survive past Done (documenting the gap); \
-         if this fails because the event is now GONE, the gap may already be \
-         fixed and this test should assert the correct behavior instead: {events:?}"
+        "the post-completion rate-limit notice is session-scoped: {events:?}"
     );
-    assert_eq!(
-        events.len(),
-        done_pos + 2,
-        "extra or missing events: {events:?}"
+    assert_eq!(events.len(), 4, "extra or missing events: {events:?}");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text } if text == "orphaned"
+        )),
+        "the orphaned turn delta must not follow Done: {events:?}"
     );
 }
 
