@@ -354,6 +354,22 @@ fn main() {
         capture_non_frame_tolerance();
     } else if first.contains("scenario:approval") {
         approval(&mut stdin);
+    // D45: reusable lifecycle-fault primitives, mirroring
+    // fake_codex.rs's own D45 section — see each function's own comment for
+    // which fault on docs/debt/D45-provider-lifecycle-fault-matrix.md it
+    // expresses and how its meaning differs on this wire.
+    } else if first.contains("scenario:silent-stall") {
+        silent_stall();
+    } else if first.contains("scenario:crash-mid-turn") {
+        crash_mid_turn();
+    } else if first.contains("scenario:partial-frame") {
+        partial_frame_then_exit();
+    } else if first.contains("scenario:die-after-approval") {
+        die_after_approval();
+    } else if first.contains("scenario:duplicate-completion") {
+        duplicate_completion();
+    } else if first.contains("scenario:late-completion-after-interrupt") {
+        late_completion_after_interrupt(&mut stdin);
     } else {
         emit(
             r#"{"type":"result","subtype":"error_during_execution","errors":["unknown scenario"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-x"}"#,
@@ -869,4 +885,176 @@ fn diagnostics() {
     emit(
         r#"{"type":"result","subtype":"success","result":"done","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-d"}"#,
     );
+}
+
+// ---------------------------------------------------------------------------
+// D45: reusable provider lifecycle fault primitives
+// (docs/debt/D45-provider-lifecycle-fault-matrix.md)
+//
+// Ports the six primitives PR #203 built on `fake_codex.rs`, but Claude's
+// wire (stream-json over stdio, no per-turn ids, no JSON-RPC handshake
+// distinct from the turn itself) is different enough that several change
+// what they prove rather than porting one-for-one — see each function's own
+// comment.
+// ---------------------------------------------------------------------------
+
+/// D45 primitive: **setup-stage stall**, changed meaning. Codex's mirror
+/// (`fake-codex-thread-setup-stall`) proves `startup_timeout` bounds the
+/// handshake before any turn begins — `ClaudeHarness` has no such field or
+/// wrapped `setup` future at all (`crates/harness/src/claude/mod.rs`'s `run`
+/// spawns the child and starts `run_session` directly; nothing there is
+/// `tokio::time::timeout`-wrapped). Claude's wire also has no separate
+/// "setup" phase to stall in the first place: the very first stdout line a
+/// healthy CLI writes (`system`/`init`) IS the turn's own output, read by the
+/// same `stdout_lines.next_line()` arm that reads everything else, so a stall
+/// before the first frame and a stall mid-turn are the identical code path,
+/// not two things to test separately.
+///
+/// What this scenario proves instead: a run that produces literally zero
+/// output relies ENTIRELY on `RunControls::interrupt` to ever end — there is
+/// no internal bound of any kind. This is not a fixture limitation; it is a
+/// candidate production defect in `crates/harness/src/claude/mod.rs`, filed
+/// as its own row rather than fixed here (see the PR description).
+fn silent_stall() {
+    // Deliberately no `emit` at all, unlike `interrupt()` (which emits
+    // `system`/`init` before wedging) — this is the "nothing was ever heard
+    // from the provider" shape, not "the provider went quiet mid-turn".
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+/// D45 primitive: **stderr_then_exit, mid-turn.** Unlike Codex (which has two
+/// distinct crash-message call sites — a canned startup-failure sentence and
+/// a real `crash_message` for a mid-turn death), Claude's `run_session` has
+/// exactly ONE crash-reporting site (`crates/harness/src/claude/mod.rs`'s
+/// post-loop teardown, `crash_message("claude", status, &stderr_tail)`) that
+/// fires whenever stdout closes with no `Done` ever having been sent — before
+/// this, nothing in this suite exercised it at all: every existing scenario
+/// either completes cleanly or wedges past an interrupt.
+///
+/// The 100ms sleep after flushing stderr, and before exiting, gives the
+/// separate stderr-reading task (spawned in `ClaudeHarness::run`) a bounded
+/// head start to drain and store this line before stdout's own EOF races it
+/// — the same reasoning as `fake_codex.rs::crash_mid_turn`'s identical sleep.
+fn crash_mid_turn() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-crash"}"#,
+    );
+    emit(
+        r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}"#,
+    );
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "boom: fake claude crashed mid-turn");
+    let _ = stderr.flush();
+    drop(stderr);
+    std::thread::sleep(Duration::from_millis(100));
+    exit(66);
+}
+
+/// D45 primitive: **partial_line.** "stdout closes halfway through a frame":
+/// half a JSON object, no trailing newline, then exit. `tokio::io::Lines`
+/// (`crates/harness/src/claude/mod.rs`'s `stdout_lines`) still yields
+/// whatever was buffered as one final "line" once it hits EOF with no
+/// delimiter, exactly like Codex's `BufReader::lines()` — this proves that
+/// truncated tail becomes exactly one `Malformed` diagnostic (discriminator
+/// `"unparseable"`, since it never parses as JSON at all) rather than being
+/// silently dropped, and that the exit right behind it still produces a
+/// bounded, private `Done` through the same crash-message path
+/// `crash_mid_turn` above exercises.
+fn partial_frame_then_exit() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-partial"}"#,
+    );
+    let mut out = std::io::stdout();
+    let _ = write!(
+        out,
+        r#"{{"type":"stream_event","parent_tool_use_id":null,"event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"cu"#
+    );
+    let _ = out.flush();
+    std::thread::sleep(Duration::from_millis(100));
+    exit(0);
+}
+
+/// D45 primitive: **stdin breaks while Comet writes a decision.** Raises a
+/// `can_use_tool` control request, then exits immediately without ever
+/// reading the reply. `crates/harness/src/claude/mod.rs`'s `stdin_writer`
+/// documents that a write to a dead child's stdin (EPIPE) is "tolerated and
+/// logged, matching the TS harness's swallowed-EPIPE behavior" — the same
+/// invariant `fake_codex.rs::die_after_approval` exercises for the JSON-RPC
+/// side, driven here through Claude's control-channel shape instead. Which
+/// side of the race the write lands on is not pinned down — what this proves
+/// is that either way, the run still ends in one bounded, non-panicking
+/// `Done`, never a hang.
+fn die_after_approval() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-die-after-approval"}"#,
+    );
+    emit(
+        r#"{"type":"control_request","request_id":"die-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo hi"},"description":"echo hi","tool_use_id":"toolu_die"}}"#,
+    );
+    exit(0);
+}
+
+/// D45 primitive: **duplicate**, changed meaning. Codex's mirror documents a
+/// gap in one specific notification arm that forgets to consult a guard that
+/// exists (`TurnRouter::is_completed`). Claude has no per-turn router or
+/// completion guard of ANY kind: `run_session`'s main loop
+/// (`crates/harness/src/claude/mod.rs`) sets a local `any_done = true` when a
+/// `Frame::Result` produces a `Done`, but only breaks the loop on that when
+/// `interrupted` is also true — on the ordinary path it goes right back to
+/// reading the next stdout line, with nothing stopping a SECOND `result`
+/// frame from producing a SECOND `Done`. This is a broader version of the
+/// same shape as D135, on a wire with no id-keyed router to have forgotten to
+/// consult in the first place. Documents CURRENT behavior, not a fix — see
+/// the driving test's own comment and the PR description for the proposed
+/// debt row.
+fn duplicate_completion() {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-dup"}"#,
+    );
+    emit(
+        r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}}"#,
+    );
+    emit(r#"{"type":"result","subtype":"success","session_id":"sess-dup"}"#);
+    // An unrelated notification in between, also covering "arrives among
+    // unrelated notifications" from D45's own list — informational and
+    // must stay quiet either way.
+    emit(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#);
+    emit(r#"{"type":"result","subtype":"success","session_id":"sess-dup"}"#);
+}
+
+/// D45 primitive: **late_reply, specifically "delayed until after
+/// cancellation".** Reads the interrupt control request Comet sends (mirrors
+/// `interrupt()`'s wedge, but actually consumes it), then — instead of
+/// dying or going silent — waits past the point the harness has already
+/// committed to `interrupted = true` and sends a plain, ordinary `result`
+/// frame with `subtype: "success"`, as if the CLI decided to finish the turn
+/// normally rather than honor the interrupt. `Frame::Result`'s own arm in
+/// `normalize.rs` reads the shared `interrupted` flag when it picks
+/// `DoneStatus`, so this reply arriving late must still resolve to
+/// `Interrupted`, not `Completed` — the exact claim `fake_codex.rs`'s mirror
+/// makes, and for the same reason: `interrupted` is set synchronously the
+/// moment the interrupt token fires, independent of anything the provider
+/// does or says afterward.
+///
+/// Unlike Codex, nothing here needs to reply to the interrupt request itself
+/// — Claude's `interrupt_request_line` carries no id the harness waits on; it
+/// is fire-and-forget over stdin, so simply reading it off the pipe (rather
+/// than leaving it unread, which would still work) is enough to prove the
+/// harness never blocks on an acknowledgment that never comes.
+fn late_completion_after_interrupt(stdin: &mut StdinLock<'_>) {
+    emit(
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-late"}"#,
+    );
+    emit(
+        r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}"#,
+    );
+    let int_line = read_line(stdin);
+    if !int_line.contains(r#""subtype":"interrupt""#) {
+        emit(
+            r#"{"type":"result","subtype":"error_during_execution","errors":["expected an interrupt control request"],"session_id":"sess-late"}"#,
+        );
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    emit(r#"{"type":"result","subtype":"success","session_id":"sess-late"}"#);
 }
