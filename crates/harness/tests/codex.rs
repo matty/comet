@@ -1337,24 +1337,13 @@ async fn codex_provider_dying_before_an_approval_decision_still_ends_bounded() {
     assert!(error.contains("exited unexpectedly"), "{error}");
 }
 
-/// D45 primitive: duplicate (plus "arrives among unrelated notifications").
+/// D135 regression: a duplicate `turn/completed` notification produces one
+/// terminal event, even when an unrelated notification arrives between them.
 ///
-/// This documents CURRENT behavior, not an aspiration. `TurnRouter::is_completed`
-/// (`crates/harness/src/codex/mod.rs:609`) is a real, consulted guard —
-/// `note_started` refuses to revive a completed turn with it (`:614`), so
-/// does `adopt_started` (`:640`), and the steer-queue decision consults it
-/// too (`:1182`). What it does NOT cover is the one path that matters here:
-/// the `"turn/completed"` notification arm itself (`:957`) calls
-/// `router.note_completed(&id)` to RECORD the id, but never calls
-/// `is_completed` to check whether `id` was already recorded before running
-/// its full send-`Done` sequence (`:977`-`:990`). So a duplicate
-/// `turn/completed` for an already-finished turn produces a SECOND `Done` —
-/// not because no guard exists, but because the guard that does exist was
-/// never wired into this one arm. This test is the evidence for that gap,
-/// not a fix for it (fixing it needs a change in
-/// `crates/harness/src/codex/mod.rs`, out of scope for a tests-only slice).
+/// Removing the completion arm's `TurnRouter::is_completed` gate must make
+/// this receive two `Done` events from the real subprocess fixture.
 #[tokio::test]
-async fn codex_duplicate_turn_completed_is_not_deduplicated_today() {
+async fn codex_duplicate_turn_completed_emits_one_done() {
     let (controls, _steer, _token) = controls("Yes");
     let events = run_to_end(
         &harness(),
@@ -1368,12 +1357,10 @@ async fn codex_duplicate_turn_completed_is_not_deduplicated_today() {
         .filter(|e| matches!(e, AgentEvent::Done { .. }))
         .count();
     assert_eq!(
-        done_count, 2,
-        "known gap (see this test's doc comment): expected two Done events \
-         for a duplicated turn/completed, got {done_count} in {events:?}"
+        done_count, 1,
+        "expected one Done event for a duplicated turn/completed, got {done_count} in {events:?}"
     );
-    // Neither Done reports anything worse than a normal completion — the gap
-    // is an extra terminal event, not a wrong or crashing one.
+    // The terminal result remains a normal completion.
     assert!(
         events.iter().all(|e| !matches!(
             e,

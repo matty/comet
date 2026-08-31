@@ -968,20 +968,9 @@ fn die_after_approval(tid: &str) {
 /// same turn id, with an unrelated notification in between (also covering "a
 /// response ... arrives among unrelated notifications" from the same list).
 ///
-/// This is NOT a test that the harness ignores the duplicate — it does not,
-/// and it is not for lack of a guard. `TurnRouter::is_completed`
-/// (`crates/harness/src/codex/mod.rs:609`) is real and consulted elsewhere —
-/// `note_started` (`:614`) and `adopt_started` (`:640`) both refuse to revive
-/// an id it already has, and the steer-queue decision (`:1182`) reads it too.
-/// The `"turn/completed"` arm (`:957`) calls `note_completed` to RECORD the
-/// id but never calls `is_completed` to check it first, so nothing stops the
-/// arm from running its full send-Done sequence a second time for an id
-/// already recorded as finished. The test this scenario drives documents
-/// that as-observed behavior (a second `Done` reaches the stream) rather than
-/// asserting the stronger "exactly one terminal outcome" D45's own page says
-/// the suite has no invariant for yet — closing that gap needs wiring
-/// `is_completed` into this one arm, a change in
-/// `crates/harness/src/codex/mod.rs`, out of scope here.
+/// D135's subprocess regression proves that the router forwards exactly one
+/// `Done` for these frames, by consulting its completed-turn state before it
+/// begins the terminal sequence.
 fn duplicate_completion(tid: &str) {
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
