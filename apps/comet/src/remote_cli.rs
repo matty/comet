@@ -9,7 +9,10 @@ use comet_proto::{
     LanSettings, RemoteConnectionState, RemoteEndpoint, RemoteEntry, ServerHello, ServerId,
     TrustedClient,
 };
-use comet_rpc::{RpcClient, TlsIdentity, connect_ws, methods, pair_client_zeroizing};
+use comet_rpc::{
+    ClientPresence, RpcClient, TlsIdentity, connect_ws_with_presence, methods,
+    pair_client_zeroizing,
+};
 use data_encoding::{BASE32_NOPAD, HEXLOWER};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -390,7 +393,10 @@ async fn watch_first<T: serde::de::DeserializeOwned>(
 async fn local_client(data_dir: &Path, ipc_port: u16) -> anyhow::Result<Option<RpcClient>> {
     let Some(client) = tokio::time::timeout(
         Duration::from_millis(750),
-        connect_ws(&format!("ws://127.0.0.1:{ipc_port}")),
+        connect_ws_with_presence(
+            &format!("ws://127.0.0.1:{ipc_port}"),
+            ClientPresence::Administrative,
+        ),
     )
     .await
     .ok()
@@ -692,6 +698,72 @@ mod tests {
             remote.server_id
         );
         assert_ne!(identity_a.server_id(), identity_b.server_id());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_admin_constructor_declares_non_supervising_presence() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        struct PresenceHelloService {
+            hello: ServerHello,
+            presence: std::sync::Arc<AtomicU8>,
+        }
+
+        #[async_trait::async_trait]
+        impl comet_rpc::RpcService for PresenceHelloService {
+            async fn handle(
+                &self,
+                method: &str,
+                _params: serde_json::Value,
+            ) -> Result<comet_rpc::RpcReply, comet_rpc::RpcError> {
+                match method {
+                    methods::SERVER_HELLO => comet_rpc::RpcReply::value(&self.hello),
+                    other => Err(comet_rpc::RpcError::UnknownMethod(other.into())),
+                }
+            }
+
+            fn attached(
+                &self,
+                presence: comet_rpc::ClientPresence,
+            ) -> Option<comet_rpc::ConnectionLease> {
+                self.presence.store(
+                    match presence {
+                        comet_rpc::ClientPresence::Supervising => 1,
+                        comet_rpc::ClientPresence::Administrative => 2,
+                    },
+                    Ordering::SeqCst,
+                );
+                None
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let identity = comet_identity::DeviceIdentity::load_or_create(dir.path()).unwrap();
+        let presence = std::sync::Arc::new(AtomicU8::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(comet_rpc::serve_ws_listener(
+            listener,
+            std::sync::Arc::new(PresenceHelloService {
+                hello: ServerHello {
+                    protocol_version: comet_proto::PROTOCOL_VERSION,
+                    server_id: identity.server_id().clone(),
+                    device_id: "local".into(),
+                    name: "Local".into(),
+                    capabilities: vec![],
+                },
+                presence: presence.clone(),
+            }),
+        ));
+
+        let client = local_client(dir.path(), port)
+            .await
+            .unwrap()
+            .expect("the test IPC listener is available");
+        assert_eq!(presence.load(Ordering::SeqCst), 2);
+
+        drop(client);
         server.abort();
     }
 

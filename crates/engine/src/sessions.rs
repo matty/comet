@@ -153,7 +153,7 @@ struct RunHandle {
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
     /// ignores its token can never strand the run.
-    cancel: watch::Sender<bool>,
+    cancel: watch::Sender<Option<DoneStatus>>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
     pending_approvals: PendingApprovals,
@@ -673,7 +673,7 @@ impl SessionsEngine {
         }
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(None);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
 
@@ -910,6 +910,15 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_with_status(chat_id, DoneStatus::Interrupted)
+            .await
+    }
+
+    async fn interrupt_with_status(
+        &self,
+        chat_id: &str,
+        terminal_status: DoneStatus,
+    ) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -945,7 +954,14 @@ impl SessionsEngine {
         token.cancel();
         // … plus the engine-side grace deadline in the run task, so a harness that
         // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
+        cancel.send_if_modified(|status| {
+            if status.is_none() {
+                *status = Some(terminal_status);
+                true
+            } else {
+                false
+            }
+        });
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {
@@ -1105,7 +1121,10 @@ impl SessionsEngine {
             let _ = live.engine_tx.send(AgentEvent::Error {
                 message: unattended_note(bound, live.kind),
             });
-            match self.interrupt(&chat_id).await {
+            match self
+                .interrupt_with_status(&chat_id, DoneStatus::Expired)
+                .await
+            {
                 Ok(true) => {
                     ended += 1;
                     tracing::info!(
@@ -2028,7 +2047,7 @@ async fn drive_run(
     doc: Arc<SessionDoc>,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
-    mut cancel_rx: watch::Receiver<bool>,
+    mut cancel_rx: watch::Receiver<Option<DoneStatus>>,
     resume_state: RunResumeState,
 ) {
     // This must be the first task-owned local: every later operation includes
@@ -2145,12 +2164,14 @@ async fn drive_run(
     };
     let mut last_stream_activity = tokio::time::Instant::now();
 
+    let mut interrupt_status = None;
     let final_status = loop {
         let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
                 interrupted = true;
+                interrupt_status = *cancel_rx.borrow_and_update();
                 interrupt_deadline = Some(
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3),
                 );
@@ -2159,7 +2180,7 @@ async fn drive_run(
             _ = tokio::time::sleep_until(
                 interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if interrupt_deadline.is_some() => AgentEvent::Done {
-                status: DoneStatus::Interrupted,
+                status: interrupt_status.unwrap_or(DoneStatus::Interrupted),
                 result: None,
                 error: None,
                 session_id: None,
@@ -2250,7 +2271,7 @@ async fn drive_run(
                     session_id: None,
                 },
                 None if interrupted => AgentEvent::Done {
-                    status: DoneStatus::Interrupted,
+                    status: interrupt_status.unwrap_or(DoneStatus::Interrupted),
                     result: None,
                     error: None,
                     session_id: None,
@@ -2278,6 +2299,12 @@ async fn drive_run(
                 continue;
             }
         };
+
+        if let AgentEvent::Done { status, .. } = &mut event
+            && let Some(interrupt_status) = interrupt_status
+        {
+            *status = interrupt_status;
+        }
 
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled), and push
@@ -2650,7 +2677,7 @@ async fn drive_run(
 
         if let AgentEvent::Done { status, .. } = &event {
             let message_status = match status {
-                DoneStatus::Interrupted => MessageStatus::Aborted,
+                DoneStatus::Interrupted | DoneStatus::Expired => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
             // No dangling chips: a run that ends for ANY reason (completed,
@@ -3406,7 +3433,7 @@ mod tests {
         let minted: MintedApprovals = Arc::new(Mutex::new(HashSet::new()));
         lock(&minted).insert(format!("{run_id}-approval"));
         let (steer_tx, _steer_rx) = mpsc::channel(1);
-        let (cancel, _cancel_rx) = watch::channel(false);
+        let (cancel, _cancel_rx) = watch::channel(None);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
         ParkedRun {
             handle: RunHandle {
@@ -3782,7 +3809,7 @@ mod tests {
         pending_inputs: PendingInputs,
     ) -> RunHandle {
         let (steer_tx, _steer_rx) = mpsc::channel(1);
-        let (cancel, _cancel_rx) = watch::channel(false);
+        let (cancel, _cancel_rx) = watch::channel(None);
         let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
         RunHandle {
             run_id: run_id.into(),
@@ -3819,7 +3846,7 @@ mod tests {
         );
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
         let (steer_tx, _steer_rx) = mpsc::channel(1);
-        let (cancel, _cancel_rx) = watch::channel(false);
+        let (cancel, _cancel_rx) = watch::channel(None);
         let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
         lock(&sessions.inner.runs).insert(
             "chat-1".into(),

@@ -21,28 +21,26 @@ A monitoring cron running `comet status` every five minutes means
 nothing in the log says why, because from the engine's point of view a
 supervisor keeps arriving.
 
-## Why it is not fixed here
+## Resolution
 
-**It fails in the safe direction.** The bad outcome is a turn that stays parked
-and answerable, not a valid run killed or a decision invented. Compare the
-alternative shape of this bug: an administrative call *not* counting while a
-Desktop client shares the same code path would expire runs in front of a present
-user.
+The first client frame is now a connection hello carrying `supervising`. Every
+ordinary constructor sends `true`; the shared `remote_cli::local_client`
+constructor used by `comet status` and every online `comet remote …` command
+sends `false`. `serve_connection_guarded` delays its one `attached()` call until
+that frame is decoded and carries the declared intent through every transport.
+`EngineRpc` returns no `PresenceLease` for an administrative connection, so it
+neither clears nor restarts `unattended_since`.
 
-**Telling the two apart is a design change.** It needs the client to declare
-what it is — a supervising viewport versus a one-shot administrative call — which
-means a new field in the hello handshake, a `PROTOCOL_VERSION` question (D12's
-cost), and a default for older clients that is wrong either way. That is a
-slice's worth of decision, not a patch, and slice 1.9 deliberately added no new
-user-facing or wire-facing control.
+Compatibility stays safe in both directions. A new server treats an old first
+request, a missing hello, and a hello missing `supervising` as supervising. An
+old server ignores the new hello frame and continues counting the administrative
+connection, which is the prior fail-safe behavior: expiry may be delayed, never
+caused in front of a present user.
 
-## How to apply, if it ever needs closing
+That additive field does not independently require a `PROTOCOL_VERSION` bump
+under the constant's own rule, because an older peer ignoring it preserves the
+safe historical behavior. This change ships at version 13 because D26's new
+`DoneStatus::Expired` enum variant does require the all-or-nothing decode bump.
 
-Carry the intent on `ServerHello` (a `presence: bool`, defaulting to `true` so an
-older client keeps today's behavior) and have `attached()` skip the lease when a
-client declares itself administrative. `comet status` and the `remote`
-subcommands are the only callers that would set it, and they already share one
-constructor.
-
-Until then: an operator who wants the bound to actually fire must not poll a
-daemon on a schedule shorter than the bound.
+Literal wire tests pin the old/missing defaults and the administrative value;
+transport, engine, and CLI-constructor tests pin the lease and timestamp effects.

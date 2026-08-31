@@ -1293,8 +1293,8 @@ impl RpcService for LocalRpcService {
     /// Forwarded, not defaulted: `rpc_service()` hands out this wrapper, so a
     /// defaulted `None` here would silently drop every embedded-UI client
     /// from the presence count.
-    fn attached(&self) -> Option<comet_rpc::ConnectionLease> {
-        self.inner.attached()
+    fn attached(&self, presence: comet_rpc::ClientPresence) -> Option<comet_rpc::ConnectionLease> {
+        self.inner.attached(presence)
     }
 }
 
@@ -1723,15 +1723,11 @@ impl RpcService for EngineRpc {
         }
     }
 
-    /// Every connection counts as a supervisor, and not every connection is a
-    /// watching human: `comet status` and the `comet remote …` subcommands open
-    /// a real IPC socket, so each one clears `unattended_since` and stamps a
-    /// fresh stretch on exit. A monitoring cron polling often enough can
-    /// therefore keep a parked approval alive indefinitely. Fails in the safe
-    /// direction (nothing expires early) and telling the two apart is a design
-    /// change, not a fix here — see `docs/debt/D29-administrative-clients-count-as-supervisors.md`.
-    fn attached(&self) -> Option<comet_rpc::ConnectionLease> {
-        Some(Box::new(self.presence.attach()))
+    fn attached(&self, presence: comet_rpc::ClientPresence) -> Option<comet_rpc::ConnectionLease> {
+        match presence {
+            comet_rpc::ClientPresence::Supervising => Some(Box::new(self.presence.attach())),
+            comet_rpc::ClientPresence::Administrative => None,
+        }
     }
 }
 
