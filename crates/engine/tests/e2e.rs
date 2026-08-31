@@ -13,6 +13,7 @@ use comet_doc::{
     MessagePart, MessageRole, MessageStatus, SegmentWriter, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry,
 };
+use comet_engine::DocsStore;
 use comet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use comet_harness::discovery::{DiscoveredModel, Discovery, DiscoveryFailure};
 use comet_harness::mock::MockHarness;
@@ -24,7 +25,6 @@ use comet_proto::{
     SteeringMode, SubagentStatus, ToolCall,
 };
 use comet_rpc::RpcService;
-use comet_sync::DocsStore;
 
 const CHAT: &str = "chat-e2e";
 const VIEWER: &str = "viewer-device";

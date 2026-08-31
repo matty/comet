@@ -4,7 +4,7 @@
 //!   inspect-chat      <data_dir> <chat_id>
 //!   cut-chat          <data_dir> <chat_id> <from_index>
 use comet_doc::SessionDoc;
-use comet_sync::DocsStore;
+use comet_engine::DocsStore;
 use loro::{LoroDoc, ToJson};
 
 fn load_doc(store: &DocsStore, doc_id: &str) -> LoroDoc {

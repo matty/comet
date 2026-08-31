@@ -1741,7 +1741,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::doc_host::CreateAdmission;
-    use comet_sync::{DocsStore, PutToolDiffOutcome};
+    use crate::{DocsStore, PutToolDiffOutcome};
 
     /// Emits a tool call, then waits for the test to allow a deliberately
     /// straggling result even after its run has been interrupted.
@@ -3888,7 +3888,7 @@ mod tests {
         assert!(matches!(
             core.doc_host
                 .put_tool_diff("chat-1", "blocked-tool", &blocked_diff),
-            Err(comet_sync::StoreError::ToolDiffPurged)
+            Err(crate::StoreError::ToolDiffPurged)
         ));
 
         // Bypass the façade to pin final cleanup independently: a writer that
@@ -5149,7 +5149,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     sidecar_result,
-                    Err(comet_sync::StoreError::ToolDiffPurged)
+                    Err(crate::StoreError::ToolDiffPurged)
                 ));
                 assert_eq!(store.load_snapshot("chat-1").unwrap(), None);
                 assert_eq!(
@@ -5246,7 +5246,7 @@ mod tests {
         assert!(matches!(
             core.doc_host
                 .put_tool_diff("chat-1", "blocked-tool", &old_diff),
-            Err(comet_sync::StoreError::ToolDiffPurged)
+            Err(crate::StoreError::ToolDiffPurged)
         ));
 
         create_chat_with_lifecycle(

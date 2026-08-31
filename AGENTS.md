@@ -28,8 +28,8 @@ copy remote authoritative data into the connecting machine's durable store.
 Rust 2024 workspace; the toolchain is pinned by `rust-toolchain.toml` (stable, with
 `rustfmt` and `clippy`). `crates/*` are libraries — `proto` (wire types), `rpc`
 (localhost + pinned-TLS transport, pairing), `engine` (storage and authoritative
-operations), `client` (remote supervision), `ui` (gpui surface), plus `harness`, `doc`,
-`sync`, `identity`, `update`. `apps/comet` is the only binary.
+operations, including the SQLite `store` module), `client` (remote supervision), `ui` (gpui
+surface), plus `harness`, `doc`, `identity`, `update`. `apps/comet` is the only binary.
 
 Two non-Rust trees, neither on the runtime path:
 

@@ -1267,7 +1267,6 @@ dependencies = [
 name = "comet-client"
 version = "0.1.15"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
  "comet-doc",
@@ -1309,7 +1308,6 @@ dependencies = [
  "comet-identity",
  "comet-proto",
  "comet-rpc",
- "comet-sync",
  "comet-update",
  "data-encoding",
  "futures",
@@ -1335,7 +1333,6 @@ dependencies = [
 name = "comet-harness"
 version = "0.1.15"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64",
  "comet-capture",
@@ -1381,14 +1378,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
- "uuid",
 ]
 
 [[package]]
 name = "comet-rpc"
 version = "0.1.15"
 dependencies = [
- "anyhow",
  "async-trait",
  "comet-identity",
  "comet-proto",
@@ -1397,7 +1392,6 @@ dependencies = [
  "hmac",
  "rand 0.10.2",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
@@ -1411,19 +1405,6 @@ dependencies = [
  "uuid",
  "x509-parser",
  "zeroize",
-]
-
-[[package]]
-name = "comet-sync"
-version = "0.1.15"
-dependencies = [
- "comet-doc",
- "comet-proto",
- "loro",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
 ]
 
 [[package]]

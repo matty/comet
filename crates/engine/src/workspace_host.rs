@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
+use crate::DocsStore;
 use comet_doc::{DeletedSpace, WorkspaceDoc};
 use comet_proto::{Chat, ChatConfig, Device, Session, Space};
-use comet_sync::DocsStore;
 
 use crate::EngineError;
 

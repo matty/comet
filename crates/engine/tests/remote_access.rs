@@ -6,6 +6,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
 
 use chrono::Utc;
+use comet_engine::{DocsStore, PutToolDiffOutcome};
 use comet_engine::{
     EngineCore, HarnessRegistry, LanServerStatus, RemoteConfigStore, RemoteRpcService,
     remote_method_allowed,
@@ -20,7 +21,6 @@ use comet_proto::{
 use comet_rpc::{
     RpcError, RpcReply, RpcService, TlsIdentity, connect_lan_rpc, methods, pair_client,
 };
-use comet_sync::{DocsStore, PutToolDiffOutcome};
 use data_encoding::BASE32_NOPAD;
 use tokio::net::{TcpListener, TcpStream};
 
