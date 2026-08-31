@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use comet_doc::{SessionCommandEntry, SessionMessageEntry, TranscriptFrame};
+use comet_doc::{
+    SessionCommandEntry, SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
+    TranscriptFrame,
+};
 use comet_engine::{EngineCore, HarnessRegistry, JournaledEvent};
 use comet_harness::CodexHarness;
-use comet_proto::{HarnessId, RunRequest, RuntimeMode};
+use comet_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, RuntimeMode, SessionStatus};
 use comet_rpc::RpcClient;
 
 const SPACE: &str = "space-provider-boundary";
@@ -75,8 +78,6 @@ fn codex_request(fixture: &EngineFixture, prompt: &str, mode: RuntimeMode) -> Ru
     }
 }
 
-// Tasks 2–4 consume this once their provider scenarios are added.
-#[allow(dead_code)]
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
@@ -91,8 +92,6 @@ where
     }
 }
 
-// Tasks 2–4 consume this once their provider scenarios are added.
-#[allow(dead_code)]
 fn commands(fixture: &EngineFixture) -> Vec<SessionCommandEntry> {
     fixture
         .core
@@ -104,8 +103,6 @@ fn commands(fixture: &EngineFixture) -> Vec<SessionCommandEntry> {
         .expect("read fixture commands")
 }
 
-// Tasks 2–4 consume this once their provider scenarios are added.
-#[allow(dead_code)]
 fn journal(fixture: &EngineFixture) -> Vec<JournaledEvent> {
     fixture
         .core
@@ -198,4 +195,71 @@ async fn fake_codex_model_discovery_and_command_endpoint_cross_engine_rpc() {
         .await
         .expect("list fake Codex commands");
     assert_eq!(commands["commands"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn fake_codex_rejected_resume_falls_back_to_a_fresh_durable_session() {
+    let fixture = EngineFixture::new();
+    let mut request = codex_request(&fixture, "scenario:resumed", RuntimeMode::ApprovalRequired);
+    request.resume = Some("resume-fail".into());
+    let queued = fixture
+        .client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({
+                "chatId": CHAT,
+                "command": SessionCommandPayload::Run {
+                    request,
+                    message_id: "m-resume-fallback".into(),
+                },
+            }),
+        )
+        .await
+        .expect("queue resume command through RPC");
+    let command_id = queued["commandId"].as_str().expect("queued command id");
+
+    wait_for(
+        || {
+            commands(&fixture).iter().any(|command| {
+                command.id == command_id && command.status == SessionCommandStatus::Applied
+            })
+        },
+        "resume command applied",
+    )
+    .await;
+    wait_for(
+        || {
+            fixture
+                .core
+                .sessions
+                .session_status(CHAT)
+                .map(|session| session.status)
+                == Some(SessionStatus::Idle)
+        },
+        "resumed session idle",
+    )
+    .await;
+
+    let replay = journal(&fixture);
+    assert!(
+        replay.iter().any(|entry| {
+            matches!(&entry.event, AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh")
+        }),
+        "the native Codex fallback must durably start th-fresh: {replay:?}"
+    );
+    assert!(matches!(
+        replay.last().map(|entry| &entry.event),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            session_id: Some(session_id),
+            ..
+        }) if session_id == "th-fresh"
+    ));
+    assert_eq!(
+        fixture.core.workspace.chat_harness_session(CHAT),
+        Some((
+            "th-fresh".into(),
+            Some(fixture.cwd.to_string_lossy().into_owned()),
+        ))
+    );
 }
