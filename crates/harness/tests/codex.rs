@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{path::Path, process::Command};
 
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
@@ -116,6 +117,167 @@ async fn run_to_end(
     )
     .await
     .expect("run finished in time")
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap_or_else(|error| panic!("git {args:?} starts: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn linked_worktree(branch: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let checkout = temp.path().join("checkout");
+    std::fs::create_dir(&checkout).expect("checkout directory");
+    git(&checkout, &["init"]);
+    git(&checkout, &["config", "user.email", "test@example.com"]);
+    git(&checkout, &["config", "user.name", "Comet test"]);
+    std::fs::write(checkout.join("seed"), "seed\n").expect("seed file");
+    git(&checkout, &["add", "seed"]);
+    git(&checkout, &["commit", "-m", "seed"]);
+    let worktree = temp.path().join("linked-worktree");
+    git(
+        &checkout,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            worktree.to_str().expect("worktree path"),
+        ],
+    );
+    (temp, checkout, worktree)
+}
+
+fn done_error(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Done {
+                error: Some(error), ..
+            } => Some(error.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no policy observation: {events:#?}"))
+}
+
+/// Break caught: omitting the escalation notice or changing either preserved
+/// policy makes a real linked worktree run misrepresent its effective access.
+#[tokio::test]
+async fn slashed_linked_worktree_escalation_is_visible_and_preserves_policy() {
+    let (_temp, _checkout, worktree) = linked_worktree("feature/visible-sandbox");
+
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:echo-policy");
+    req.cwd = worktree.display().to_string();
+    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    let events = run_to_end(&harness(), req, controls).await;
+
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::SessionStarted { .. })
+    ));
+    assert_eq!(
+        events.get(1),
+        Some(&AgentEvent::Notice {
+            kind: NoticeKind::Info,
+            severity: NoticeSeverity::Warning,
+            summary: "Sandbox access widened".into(),
+            detail: Some(
+                "This run can write anywhere on this machine, outside the workspace. Use a branch name without a slash to keep workspace-only write access.".into(),
+            ),
+            key: Some("codex-sandbox-escalated".into()),
+        }),
+        "the widening notice must follow SessionStarted: {events:#?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+            .count(),
+        1,
+        "the widening notice must be emitted exactly once: {events:#?}"
+    );
+    assert!(
+        done_error(&events).contains(
+            "thread=on-request turn=on-request sandbox=danger-full-access policy=dangerFullAccess"
+        ),
+        "the sandbox must widen without changing runtime-mode-derived policy: {events:#?}"
+    );
+}
+
+/// Break caught: widening outside the slash-named linked-worktree case would
+/// silently grant broader access to an ordinary checkout or request.
+#[tokio::test]
+async fn sandbox_escalation_is_absent_outside_the_linked_slash_branch_case() {
+    let (_temp, checkout, slashed) = linked_worktree("feature/visible-sandbox");
+    for (name, cwd, sandbox) in [
+        ("main checkout", checkout, SandboxLevel::WorkspaceWrite),
+        ("other sandbox", slashed, SandboxLevel::ReadOnly),
+    ] {
+        let (run_controls, _steer, _token) = controls("Yes");
+        let mut req = request("scenario:echo-policy");
+        req.cwd = cwd.display().to_string();
+        req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+        req.sandbox = sandbox;
+        let events = run_to_end(&harness(), req, run_controls).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. })),
+            "{name} must not announce a sandbox escalation: {events:#?}"
+        );
+        let expected = match sandbox {
+            SandboxLevel::WorkspaceWrite => "workspace-write policy=workspaceWrite",
+            SandboxLevel::ReadOnly => "read-only policy=readOnly",
+            SandboxLevel::DangerFullAccess => unreachable!(),
+        };
+        assert!(
+            done_error(&events).contains(expected),
+            "{name} must preserve its requested sandbox: {events:#?}"
+        );
+    }
+
+    let non_worktree = tempfile::tempdir().expect("non-worktree directory");
+    let (run_controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:echo-policy");
+    req.cwd = non_worktree.path().display().to_string();
+    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    let events = run_to_end(&harness(), req, run_controls).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice { .. })),
+        "a non-worktree directory must not announce a sandbox escalation: {events:#?}"
+    );
+    assert!(
+        done_error(&events).contains("workspace-write policy=workspaceWrite"),
+        "a non-worktree directory must retain workspace-write: {events:#?}"
+    );
+
+    let (_temp, _checkout, plain) = linked_worktree("plain-branch");
+    let (run_controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:echo-policy");
+    req.cwd = plain.display().to_string();
+    req.runtime_mode = RuntimeMode::AutoAcceptEdits;
+    let events = run_to_end(&harness(), req, run_controls).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice { .. })),
+        "a plain branch must not announce a sandbox escalation: {events:#?}"
+    );
+    assert!(
+        done_error(&events).contains("workspace-write policy=workspaceWrite"),
+        "a plain branch must retain workspace-write: {events:#?}"
+    );
 }
 
 /// Break caught: dropping the setup timeout leaves this collection waiting on

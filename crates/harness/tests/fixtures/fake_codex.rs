@@ -647,23 +647,25 @@ fn steer(stdin: &mut StdinLock<'_>, tid: &str) {
     }
 }
 
-/// Fail the turn with the `approvalPolicy` seen on both lines, so a test can
-/// assert the exact wire value per runtime mode without a scenario each.
+/// Fail the turn with the approval policy and sandbox seen on both lines, so a
+/// test can assert the exact wire values without a scenario each.
 fn echo_policy(turn_line: &str, thread_line: &str, tid: &str) {
-    let seen = |line: &str| {
-        line.split(r#""approvalPolicy":""#)
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .unwrap_or("<absent>")
-            .to_owned()
-    };
+    let thread: serde_json::Value = serde_json::from_str(thread_line).unwrap_or_default();
+    let turn: serde_json::Value = serde_json::from_str(turn_line).unwrap_or_default();
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or("<absent>").to_owned();
     emit(&format!(
         r#"{{"id":{tid},"result":{{"turn":{{"id":"t-1"}}}}}}"#
     ));
     emit(r#"{"method":"turn/started","params":{"turn":{"id":"t-1"}}}"#);
     fail_turn(
         tid,
-        &format!("thread={} turn={}", seen(thread_line), seen(turn_line)),
+        &format!(
+            "thread={} turn={} sandbox={} policy={}",
+            text(&thread["params"]["approvalPolicy"]),
+            text(&turn["params"]["approvalPolicy"]),
+            text(&thread["params"]["sandbox"]),
+            text(&turn["params"]["sandboxPolicy"]["type"]),
+        ),
     );
 }
 

@@ -52,8 +52,8 @@ use tokio::sync::mpsc;
 
 use comet_proto::{
     AgentEvent, ApprovalDecision, ApprovalRequest, DiagnosticSeverity, DoneStatus,
-    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, RunRequest,
-    RuntimeMode, SteeringMode,
+    HarnessCapabilities, HarnessId, HarnessProbe, InstallMethod, ModelCatalog, NoticeKind,
+    NoticeSeverity, RunRequest, RuntimeMode, SteeringMode,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -147,16 +147,26 @@ fn worktree_on_slashed_branch(cwd: &str) -> bool {
         .is_some_and(|branch| branch.contains('/'))
 }
 
+/// A normalized request plus the user-visible consequence of normalizing it.
+struct NormalizedRunRequest {
+    request: RunRequest,
+    sandbox_widened: bool,
+}
+
 /// Apply the request rewrites that must precede both launch and wire setup.
-pub fn normalize_run_request(mut request: RunRequest) -> RunRequest {
+pub fn normalize_run_request(request: RunRequest) -> RunRequest {
+    normalize_run_request_with_context(request).request
+}
+
+fn normalize_run_request_with_context(mut request: RunRequest) -> NormalizedRunRequest {
     // Historical Codex ≤0.144.x compatibility policy (docs/debt/README.md D13): a
     // workspace-write sandbox could derive a malformed mount for a linked
     // worktree whose branch contains '/'. Escalate that exact shape instead
     // of shipping a session where commands cannot run. This is maintained as
     // compatibility behavior, not as a claim about the currently captured CLI.
-    if request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
-        && worktree_on_slashed_branch(&request.cwd)
-    {
+    let sandbox_widened = request.sandbox == comet_proto::SandboxLevel::WorkspaceWrite
+        && worktree_on_slashed_branch(&request.cwd);
+    if sandbox_widened {
         tracing::warn!(
             cwd = %request.cwd,
             "codex sandbox escalated to danger-full-access: linked worktree on a \
@@ -171,19 +181,22 @@ pub fn normalize_run_request(mut request: RunRequest) -> RunRequest {
         // forced. On a full-access request the pair stays coherent by
         // coincidence; on any other mode it does not — the request now
         // runs with a danger-full-access sandbox under a mode that did
-        // not ask for one. Whoever next derives Codex's approval *policy*
-        // from `runtime_mode` still has to decide whether escalating the
-        // sandbox here should escalate the policy too.
+        // not ask for one. Approval policy and reviewer remain derived
+        // from `runtime_mode` at thread and turn start; only the sandbox
+        // is widened by this compatibility workaround.
         request.sandbox = comet_proto::SandboxLevel::DangerFullAccess;
     }
-    request
+    NormalizedRunRequest {
+        request,
+        sandbox_widened,
+    }
 }
 
 /// Build the provider-owned parameters for starting a new Codex thread.
 pub fn thread_start_params(request: &RunRequest) -> Value {
     // Approval policy is derived, not pinned. ApprovalRequired intentionally
     // maps to `untrusted`; AutoAcceptEdits and Auto map to `on-request` now
-    // that provider approvals reach Comet's approval surface (D13).
+    // that provider approvals reach Comet's approval surface.
     let mut params = serde_json::Map::new();
     params.insert("cwd".into(), request.cwd.clone().into());
     params.insert(
@@ -358,8 +371,9 @@ impl CodexHarness {
             //
             // Two of the four carry a caveat worth knowing before reading this
             // list as four guarantees. `AutoAcceptEdits`'s workspace-write
-            // sandbox can be silently raised to danger-full-access by the
-            // linked-worktree workaround below (`docs/debt/README.md` D13). And `Auto`
+            // sandbox can be raised to danger-full-access by the linked-worktree
+            // workaround below (`docs/debt/README.md` D13); the run emits a
+            // transcript warning when that happens. And `Auto`
             // hands review to the provider via `approvalsReviewer:
             // "auto_review"` — no capture exercised that path, so what reaches
             // Comet in that mode follows the mapping table rather than an
@@ -518,8 +532,8 @@ impl Harness for CodexHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let request = normalize_run_request(request);
-        let mut cmd = build_run_command(&exe, &request);
+        let normalized = normalize_run_request_with_context(request);
+        let mut cmd = build_run_command(&exe, &normalized.request);
         let mut child = cmd
             .spawn()
             .map_err(|error| crate::spawn_failure(&exe, &error))?;
@@ -559,7 +573,8 @@ impl Harness for CodexHarness {
             incoming,
             event_tx,
             controls,
-            request,
+            request: normalized.request,
+            sandbox_widened: normalized.sandbox_widened,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             startup_timeout: self.startup_timeout,
@@ -587,6 +602,9 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     request: RunRequest,
+    /// True only for the linked-worktree compatibility escalation. The event
+    /// follows SessionStarted so the transcript already has its run boundary.
+    sandbox_widened: bool,
     interrupt_grace: Duration,
     kill_grace: Duration,
     startup_timeout: Duration,
@@ -679,6 +697,7 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         request,
+        sandbox_widened,
         interrupt_grace,
         kill_grace,
         startup_timeout,
@@ -819,6 +838,25 @@ async fn run_session(session: Session) {
     {
         shutdown_child(&mut child, kill_grace).await;
         tree.terminate();
+        return;
+    }
+
+    if sandbox_widened
+        && !send(
+            &event_tx,
+            AgentEvent::Notice {
+                kind: NoticeKind::Info,
+                severity: NoticeSeverity::Warning,
+                summary: "Sandbox access widened".into(),
+                detail: Some(
+                    "This run can write anywhere on this machine, outside the workspace. Use a branch name without a slash to keep workspace-only write access.".into(),
+                ),
+                key: Some("codex-sandbox-escalated".into()),
+            },
+        )
+        .await
+    {
+        shutdown_child(&mut child, kill_grace).await;
         return;
     }
 
