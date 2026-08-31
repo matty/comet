@@ -37,8 +37,7 @@ pub use record::SESSION_ID_FILE;
 pub use record::{Requirements, SCENARIOS, ScenarioSpec, record, scenario};
 pub use sanitize::{
     NovelPath, PATH_ROOT_PLACEHOLDERS, SanitizationError, SanitizationReport, is_placeholder_token,
-    render_escaped_paths_report, render_novel_paths_report, render_suspected_maps_report,
-    sanitize_dir,
+    render_escaped_paths_report, render_novel_paths_report, sanitize_dir,
 };
 pub use sheet::{SheetScenario, render_sheet};
 pub use surface::{

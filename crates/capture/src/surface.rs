@@ -234,7 +234,7 @@ pub const MAP_PATHS: &[MapPath] = &[
 
 /// Whether `key` looks like a field name a developer chose, rather than a
 /// runtime identifier a provider generated at that position — the signal
-/// D77's own row asks for: "a heuristic *warning* on any object whose keys
+/// D77's gate uses the same heuristic on any object whose keys
 /// don't look like identifiers."
 ///
 /// ASCII letters, digits and underscore only, and not starting with a digit
@@ -263,10 +263,9 @@ pub fn is_identifier_shaped(key: &str) -> bool {
 }
 
 /// One dotted path where an *undeclared* object's own keys look enough like
-/// data to be a [`MAP_PATHS`] candidate — found by shape, at review time,
-/// rather than by a human noticing a capability-sheet field with a
-/// data-shaped name after promotion (D77's own backstop, and the one the
-/// row says cannot fire before a provider has any promoted corpus at all).
+/// data to be a [`MAP_PATHS`] candidate — found before promotion, rather than
+/// by a human noticing a capability-sheet field with a data-shaped name after
+/// publication (D77's pre-publication gate).
 ///
 /// Carries counts only, never a key's actual spelling: the same
 /// never-reproduce-what-was-withheld rule [`NovelPath`] in `sanitize.rs`

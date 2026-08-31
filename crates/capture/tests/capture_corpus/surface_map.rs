@@ -6,8 +6,8 @@
 //! an error rather than an empty answer.
 //!
 //! The D77 tests below are a different layer of the same mechanism: not the
-//! corpus walker itself, but the review-time heuristic (`surface::suspected_map`,
-//! wired into `sanitize_dir`) that warns about an undeclared map *before* a
+//! corpus walker itself, but the pre-publication gate (`surface::suspected_map`,
+//! wired into `sanitize_dir`) that rejects an undeclared map *before* a
 //! corpus exists for the walker above to check at all.
 
 use std::collections::BTreeSet;
